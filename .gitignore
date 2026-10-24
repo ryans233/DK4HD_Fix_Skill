@@ -1,0 +1,4 @@
+build/
+__pycache__/
+*.pyc
+skip_intro.png

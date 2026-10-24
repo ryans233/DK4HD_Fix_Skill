@@ -22,13 +22,16 @@
 
 ```text
 version.dll        # 部署依赖：Ultimate-ASI-Loader x64 预编译二进制，原样使用，不实现
-DK4HD_InputFix.asi # 独立实现的 x64 DLL（名称可自定；下同）
+DK4HD_Fix.asi # 独立实现的 x64 DLL（名称可自定；下同）
+DK4HD_Fix.ini # 首次启动自动生成；同名 INI（见 2.5）
 ```
+
+- 首次启动在同目录生成与 ASI 同基名的 `.ini`；`Log=0`（默认）不生成 `.log`，`Log=1` 才写同名日志（见 2.5）。
 
 - `version.dll` **不是**实现目标。直接取 Ultimate-ASI-Loader 官方 release 的 x64 `version.dll` 复制到游戏根目录；不需要自己编译、重写或逆向 loader。
 - **不要**自行实现 ASI loader / `version.dll` 代理：本文档未提供导出转发、ASI 目录扫描、加载时序等规格，loader 因此不可按本文档验收，也不在独立实现范围内。
 - 若环境里已有其他**预编译** ASI loader（其他代理 DLL 名），可直接复用；这属于部署选择，不是实现任务。
-- 成功判定只看 `DK4HD_InputFix.asi` 的行为（第 2 节 + 第 9 节）；loader 只需满足“游戏能加载它、它能发现并加载 `.asi`”这一既有事实。
+- 成功判定只看 `DK4HD_Fix.asi` 的行为（第 2 节 + 第 9 节）；loader 只需满足“游戏能加载它、它能发现并加载 `.asi`”这一既有事实。
 
 安装：两个文件放在游戏根目录（与 `DK4HD_tc.exe` 同级）。插件导出：
 
@@ -51,7 +54,7 @@ extern "C" __declspec(dllexport) void InitializeASI(void);
 
 ---
 
-## 2. 必须实现的三个行为
+## 2. 必须实现的修复行为
 
 ### 2.1 帧节奏：QPC 时间源 + 1ms 节流
 
@@ -63,24 +66,36 @@ extern "C" __declspec(dllexport) void InitializeASI(void);
 
 **目标行为**
 
-- Hook 时间函数，**完全替换返回值**为 QPC 毫秒值，不调用原函数。
+- 默认 `FramePacing=1`、`CpuIdle=1`：Hook 时间函数，返回 QPC 毫秒值，不调用原函数。
 - 每线程维护 `lastQpc`：同一线程两次调用间隔 < 1ms 时 `Sleep(1)`，然后重新读取 QPC。
-- `InitializeASI` 中调用 `timeBeginPeriod(1)`。
+- `InitializeASI` 中调用 `timeBeginPeriod(1)`（仅在 `CpuIdle=1` 时需要）。
 - 返回 `uint32_t`（调用方使用低 32 位），QPC 毫秒值按 2^32 取模。
 
-伪代码：
+**配置开关**
+
+| 组合 | 行为 |
+|---|---|
+| `FramePacing=1, CpuIdle=1` | 默认：QPC 返回值 + 1ms 节流 |
+| `FramePacing=1, CpuIdle=0` | 只替换为 QPC，不做 `Sleep(1)`（帧节奏稳定，但忙等仍在） |
+| `FramePacing=0, CpuIdle=1` | 仍 Hook；先做 1ms 节流，再调用原时间函数并返回原值（只降 CPU，不改时间源） |
+| `FramePacing=0, CpuIdle=0` | 不 Hook 时间函数，完全保持原版 |
+
+伪代码（默认组合；其他组合按上表分支）：
 
 ```c
-uint64_t HookTime(void* unused) {
+uint64_t HookTime(void* arg) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
 
     static thread_local LARGE_INTEGER last = {};
-    if (last.QuadPart && (now.QuadPart - last.QuadPart) < ticksPerMs) {
+    if (cpuIdle && last.QuadPart && (now.QuadPart - last.QuadPart) < ticksPerMs) {
         Sleep(1);
         QueryPerformanceCounter(&now);
     }
     last = now;
+
+    if (!framePacing)
+        return origTime(arg);          // 原时间函数（来自 Hook trampoline）
 
     uint64_t ms = (now.QuadPart * 1000ULL) / qpcFreq.QuadPart;
     return ms & 0xFFFFFFFFULL;
@@ -90,6 +105,7 @@ uint64_t HookTime(void* unused) {
 - `ticksPerMs = qpcFreq / 1000`；若为 0 则设为 1。
 - **顺序要求**：QPC 频率、`ticksPerMs`、`timeBeginPeriod(1)` 必须在启用 Hook 前设置好，否则 Hook 可能除以 0。
 - 该 Hook 必须只替换时间函数；不要修改 `GetTickCount64` 本身。
+- 关闭时间 Hook（两开关都为 0）时，不要创建/启用对应 MinHook。
 
 **验收**
 
@@ -130,7 +146,7 @@ uint64_t HookTime(void* unused) {
 
 **关键行为**
 
-- 注入只持续**一次** `GetDeviceState`；下一帧返回真实状态，游戏得到完整“按下沿 → 抬起沿”。
+- 注入只持续**一次** `GetDeviceState`；下一帧返回真实状态。只有同时启用 2.4 的 `ClickRelease`，游戏才能稳定得到完整的“按下沿 → 抬起沿”。
 - 不开启 `DIPROP_BUFFERSIZE`，不调用 `GetDeviceData`。
 - 不注入鼠标移动、不发送 `SendInput`、不修改光标位置。
 - 不对键盘/手柄设备注入；只对首次捕获的鼠标设备。
@@ -139,7 +155,7 @@ uint64_t HookTime(void* unused) {
 
 - 5/10/20/40/80ms 点击各 12 次，通常每档 12/12；至少 5ms 点击从约 2/12 提升到 11–12/12。
 - 不出现重复按下沿（12 次点击不应变成 20+ 次）。
-- 连续点击偶发“按下未弹起”属于另一个独立问题，不在本模块范围内；不要用注入鼠标移动去处理它。
+- `ClickLatch` 必须与 2.4 的 `ClickRelease` 一起开启；单独锁存只补“按下”，可能重现“按下未弹起”。
 
 ### 2.3 多语言定位：签名扫描，RVA 回退
 
@@ -186,6 +202,108 @@ uint64_t HookTime(void* unused) {
 - 逐字节 `memcmp`；只接受同时满足签名与前置校验的命中。
 - 扫描失败时按 exe 文件名回退到第 1 节 RVA 表，并再次校验签名；仍失败则写日志并**不要**安装 Hook 或修改内存。
 - 扫描/校验失败应安全退出，不崩溃、不修改错误地址。
+
+### 2.4 抬起沿修复：绕过鼠标轮询的空闲快速路径
+
+**问题**
+
+鼠标轮询函数在“上一帧基线全 0 且 `Poll()==1`（`DI_NOEFFECT`）”时走空闲快速路径。该判断读的是 `+0x58` 的**采样前基线**，而不是上一次 `GetDeviceState` 实际返回的 `+0x70`。如果按下被采样后、下一次 `GetDeviceState` 之前已经抬起：
+
+1. 基线仍是 0（按下帧保存的是采样前的空闲值）；
+2. 快速路径读到全 0 状态后返回“无效”，既不更新基线，也不让上层执行边沿判定；
+3. 游戏层 `G+0x60`（逻辑左键）保持 1，UI 认为左键一直按住；
+4. 鼠标移动后 `lX/lY` 非 0，快速路径失效，上层用仍为 0 的基线与当前 0 按键算出空闲沿，才清掉 `G+0x60`，UI 这时才收到抬起。
+
+**目标行为**
+
+- 在鼠标轮询函数入口 `+0x42` 处把 `75 4E`（`jnz`）改成 `EB 4E`（`jmp`），强制每帧走普通路径。
+- 写入前必须校验目标处正好是 `75 4E`；不匹配则写日志并跳过，不要猜地址。
+- 该偏移在 1.0.1 / 1.0.2 的 TC/KR/JP/SC 八个 exe 中一致；仍需先按 2.3 扫描到鼠标轮询入口。
+- `ClickRelease=1` 时应用；`0` 时不得修改。
+- 该补丁与 `ClickLatch` 独立：只开 `ClickRelease` 时短点击仍可能丢；只开 `ClickLatch` 时可能重现“按下未弹起”；推荐两者都开（默认）。
+
+**验收**
+
+- 默认（`ClickLatch=1` + `ClickRelease=1`）：5ms 点击的按下沿与抬起沿数量相等，结束后左键状态为 0。
+- 对照（`ClickLatch=1` + `ClickRelease=0`）：抬起沿明显少于按下沿，左键状态卡在 1；移动鼠标后才恢复。
+- 脚本：`tools/click_release_test.py`（第 9.6 节）。
+
+### 2.5 同名 INI 配置 + 可选日志
+
+**配置文件**
+
+- 从 ASI 自身模块路径推导：同目录、同基名、扩展名 `.ini`。例如 `DK4HD_Fix.asi` → `DK4HD_Fix.ini`。不要让 INI 文件名与 ASI 名脱钩。
+- 文件不存在时创建默认 INI；已存在时**不要覆盖**，只读取；缺失的键使用默认值。
+- 默认文件使用 UTF-8 BOM + CRLF，每个选项前有中文注释；键名保持 ASCII。
+- 读取使用 ANSI profile API（`GetPrivateProfileIntA`）即可；BOM/中文注释不影响 `[Fix]` 段和 ASCII 键。
+- 修改后重启游戏生效。
+
+`[Fix]` 段的键与默认值：
+
+| 键 | 默认 | 含义 |
+|---|---:|---|
+| `FramePacing` | 1 | QPC 毫秒时间源 |
+| `CpuIdle` | 1 | 时间函数 1ms 节流 |
+| `ClickLatch` | 1 | 短点击锁存 |
+| `ClickRelease` | 1 | 抬起沿修复 |
+| `SkipIntro` | 0 | 测试用：跳过片头/标题，直接进主菜单 |
+| `Log` | 0 | 是否输出日志；0 = 不创建/不写入 |
+
+默认 INI 内容（中文注释是规格的一部分）：
+
+```ini
+; <ASI同名>.ini -- 首次运行时自动生成。
+; 1 = 启用，0 = 禁用。默认：除 SkipIntro 和 Log 外全部启用。
+[Fix]
+; 用 QPC 毫秒时间源替换 GetTickCount64，稳定 33ms 帧节奏
+FramePacing=1
+; 时间函数 1ms 节流，消除帧限速忙等（单核占用从约 100% 降到约 2%）
+CpuIdle=1
+; 短点击锁存：捕获 WM_LBUTTONDOWN/DBLCLK，在下一帧 GetDeviceState 注入一次按下
+ClickLatch=1
+; 抬起沿修复：绕过鼠标轮询的空闲快速路径，避免“只按下、不弹起”
+ClickRelease=1
+; 测试用：跳过片头动画和标题画面，直接进入主菜单（默认关闭）
+SkipIntro=0
+; 是否输出日志：0 = 不生成/不写入 <ASI同名>.log（默认），1 = 生成
+Log=0
+```
+
+**日志**
+
+- 日志路径：同目录、同基名、扩展名 `.log`。
+- `Log=0`：**不要调用 `fopen`/创建/写入**，不能留下新的空日志文件；旧日志不要求删除。
+- `Log=1`：以 `"w"` 截断打开并写入。
+- 日志至少包含：
+  - `InitializeASI exe=<basename> base=<ptr> asi=<path>`
+  - `config: ini=<path> log=<path> FramePacing=... CpuIdle=... ClickLatch=... ClickRelease=... SkipIntro=... Log=...`
+  - 各 Hook/补丁的状态（找到/未找到、成功/失败）。
+- 不要在每个输入帧写日志；日志只用于启动/安装诊断。
+- 验收构建可以额外输出 `latch` / `inject` 行（见 9.4），但发布构建必须遵守 `Log` 开关。
+
+**验收**
+
+- `tools/test_config.py`（第 9.7 节）：
+  - 删除 INI/日志 → 启动 → INI 自动出现、键值匹配、无日志；
+  - `Log=1` → 日志出现且包含生效配置；
+  - `SkipIntro=1` → 日志出现三处 skip 补丁；
+  - `Log=0` → 不创建日志。
+
+### 2.6 SkipIntro（测试用，默认关闭）
+
+- 仅 `SkipIntro=1` 时修改三处函数；`0` 时不得修改内存。
+- 按函数序言签名定位，唯一命中才改写；找不到或命中不唯一时写日志并跳过该处，不要猜地址。
+- 三处签名与改写：
+
+| 功能 | 序言签名（十六进制） | 改写为 |
+|---|---|---|
+| 开场动画 | `88 4C 24 08 57 48 81 EC E0 01 00 00 48 8B FC B9 78 00 00 00` | `33 C0 C3`（`xor eax,eax; ret`） |
+| `EVA.DK4` 片头动画（stream 9） | `40 56 57 48 81 EC 98 02 00 00 48 8B FC B9 A6 00 00 00` | `33 C0 C3` |
+| 标题画面等待输入 | `40 56 57 48 81 EC B8 03 00 00 48 8B FC B9 EE 00 00 00` | `B8 01 00 00 00 C3`（`mov eax,1; ret`） |
+
+- 效果：启动后约 1 秒直接进入主菜单，跳过开场画面。
+- 仅测试用途；不修改游戏文件、存档或资源；删除 ASI 即恢复原启动流程。
+- 默认 `SkipIntro=0`，正常游玩必须保持 0。
 
 ---
 
@@ -236,30 +354,37 @@ uint64_t HookTime(void* unused) {
 
 ## 5. 初始化顺序（必须一致）
 
-`InitializeASI` 必须按以下顺序执行，日志顺序也一致：
+`InitializeASI` 必须按以下顺序执行；日志顺序也一致：
 
 1. `g_gameModule = GetModuleHandleA(nullptr)`；`g_base = (uintptr_t)g_gameModule`。
-2. 打开 `DK4HD_InputFix.log`（exe 同目录，`"w"` 截断）。
-3. 写 `InitializeASI exe=<basename> base=<ptr>`。
-4. `QueryPerformanceFrequency`；`ticksPerMs = freq / 1000`（至少 1）；`timeBeginPeriod(1)`；写 `qpcFreq=... ticksPerMs=...`。
-5. 扫描 `.text` 定位时间函数和鼠标轮询；失败按第 1 节 RVA 回退并校验。
-6. 写 `time=<ptr> mouse=<ptr> (scan)`。
-7. 安装鼠标轮询 Hook；写 `mouse poll hook: 1`（失败写 0，并停止后续输入 Hook）。
-8. `MH_Initialize`；写失败返回。
-9. 创建时间 Hook；写 `hook time: <status>`。
-10. 创建 `PeekMessageA` Hook；写 `hook PeekMessageA: <status>`。
-11. `MH_EnableHook(MH_ALL_HOOKS)`；写 `MH_EnableHook: <status>`。
-12. 首次鼠标轮询时安装 DInput 虚表 Hook；写 `hooked mouse GetDeviceState dev=<ptr> vt=<ptr> real=<ptr>`。
+2. 取 ASI 自身模块（`GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, &InitializeASI, ...)`），由 ASI 路径推导 INI / 日志路径（同目录、同基名）。
+3. 读取 INI；不存在则创建默认文件；已存在则不覆盖；缺失键用默认值。
+4. 仅当 `Log=1` 时打开日志（`"w"` 截断）；`Log=0` 时不得创建/打开/写入。
+5. 写 `InitializeASI exe=<basename> base=<ptr> asi=<path>` 和 `config: ini=... log=... FramePacing=... CpuIdle=... ClickLatch=... ClickRelease=... SkipIntro=... Log=...`。
+6. `QueryPerformanceFrequency`；`ticksPerMs = freq / 1000`（至少 1）；仅 `CpuIdle=1` 时 `timeBeginPeriod(1)`；写 `qpcFreq=... ticksPerMs=...`。
+7. 读取 `.text` 的 `VirtualAddress` / `Misc.VirtualSize`。
+8. 若 `SkipIntro=1`：按 2.6 定位并改写三处函数；写 `skip intro: ... patched at ...`（关闭时写 `skip intro: disabled`）。
+9. 若 `FramePacing=1 || CpuIdle=1`：按 2.3 定位时间函数；若 `ClickLatch=1 || ClickRelease=1`：定位鼠标轮询；失败按第 1 节 RVA 回退并校验；写 `time=<ptr> mouse=<ptr> (scan)`。
+10. 若 `ClickRelease=1`：校验并改写鼠标轮询 `+0x42`（`75 4E` → `EB 4E`）；写 `release fix: poll+0x42 patched at <ptr>`（关闭时写 `release fix: disabled`）。
+11. 若 `ClickLatch=1`：安装鼠标轮询 inline Hook；写 `mouse poll hook: 1`（失败写 0，并停止后续输入 Hook）。
+12. 若时间 Hook 或 `ClickLatch` 需要 MinHook：`MH_Initialize`；创建时间 Hook（若需要）；创建 `PeekMessageA` Hook（若 `ClickLatch=1`）；`MH_EnableHook(MH_ALL_HOOKS)`；分别写 `time hook: <status> (FramePacing=... CpuIdle=...)`、`hook PeekMessageA: <status>`、`MH_EnableHook: <status>`。
+13. 首次鼠标轮询时安装 DInput 虚表 Hook；写 `hooked mouse GetDeviceState dev=<ptr> vt=<ptr> real=<ptr>`。
 
-日志示例：
+- 两个时间开关都为 0、且 `ClickLatch=0` 时，不要初始化 MinHook。
+- `ClickRelease` 是纯内存字节补丁，不依赖 MinHook。
+
+日志示例（`Log=1`，`SkipIntro=0`）：
 
 ```text
-InitializeASI exe=DK4HD_tc.exe base=00007ff74cb00000
+InitializeASI exe=DK4HD_tc.exe base=00007ff74cb00000 asi=...
+config: ini=...\DK4HD_Fix.ini log=...\DK4HD_Fix.log FramePacing=1 CpuIdle=1 ClickLatch=1 ClickRelease=1 SkipIntro=0 Log=1
 qpcFreq=10000000 ticksPerMs=10000
+skip intro: disabled
 time=00007ff74cbd6630 mouse=00007ff74cdb5b10 (scan)
+release fix: poll+0x42 patched at 00007ff74cdb5b52
 mouse poll hook installed at 00007ff74cdb5b10
 mouse poll hook: 1
-hook time: 0
+time hook: 0 (FramePacing=1 CpuIdle=1)
 hook PeekMessageA: 0
 MH_EnableHook: 0
 hooked mouse GetDeviceState dev=... vt=... real=...
@@ -284,12 +409,25 @@ hooked mouse GetDeviceState dev=... vt=... real=...
 | 点击锁存有效期 | 1500ms |
 | 时间节流阈值 | 1ms/线程 |
 | 主循环 tick | 33ms（0x21） |
+| 鼠标轮询空闲快速路径跳转 | `+0x42`，`75 4E` → `EB 4E` |
+| `ClickLatch` / `ClickRelease` 默认 | 1 / 1（必须成对开启） |
+| `SkipIntro` 默认 | 0 |
+| `Log` 默认 | 0 |
+| INI / 日志路径 | ASI 同目录、同基名：`.ini` / `.log` |
+
+`SkipIntro` 的三处签名与改写：
+
+| 功能 | 序言签名 | 改写 |
+|---|---|---|
+| logos/title 动画 | `88 4C 24 08 57 48 81 EC E0 01 00 00 48 8B FC B9 78 00 00 00` | `33 C0 C3` |
+| `EVA.DK4` 片头 | `40 56 57 48 81 EC 98 02 00 00 48 8B FC B9 A6 00 00 00` | `33 C0 C3` |
+| 标题等待 | `40 56 57 48 81 EC B8 03 00 00 48 8B FC B9 EE 00 00 00` | `B8 01 00 00 00 C3` |
 
 ---
 
 ## 7. 构建
 
-要求：Windows x64、MSYS2 MinGW-w64、MinHook 源码；
+要求：Windows x64、MSYS2 MinGW-w64、MinHook 源码；验收脚本另需 Python 3.12+（见第 9 节）。
 
 ```bash
 gcc -c -O2 -DNDEBUG -Iinclude -Isrc src/buffer.c -o buffer.o
@@ -299,7 +437,7 @@ gcc -c -O2 -DNDEBUG -Iinclude -Isrc src/hde/hde64.c -o hde64.o
 ar rcs libminhook.a buffer.o hook.o trampoline.o hde64.o
 
 g++ -shared -m64 -std=c++17 -O2 -DNDEBUG -Iinclude \
-    -o DK4HD_InputFix.asi DK4HD_InputFix.cpp libminhook.a \
+    -o DK4HD_Fix.asi DK4HD_Fix.cpp libminhook.a \
     -luser32 -lwinmm -static-libgcc -static-libstdc++
 ```
 
@@ -326,42 +464,47 @@ g++ -shared -m64 -std=c++17 -O2 -DNDEBUG -Iinclude \
 objdump -p version.dll | grep -E "GetFileVersionInfo(A|SizeA)"
 ```
 
-- `DK4HD_InputFix.asi` 与 `version.dll` 放在游戏根目录（与 `DK4HD_*.exe` 同级）。
+- `DK4HD_Fix.asi` 与 `version.dll` 放在游戏根目录（与 `DK4HD_*.exe` 同级）。
+- 首次启动自动生成同名 `DK4HD_Fix.ini`（UTF-8 + 中文注释）；默认除 `SkipIntro`、`Log` 外全部启用。
+- `Log=0`（默认）时不生成/不写入 `DK4HD_Fix.log`；`Log=1` 时才生成同名日志。
 - 保持系统 `DINPUT8.dll` 不变，不要让代理层介入 DirectInput COM 接口。
-- 卸载：删除 `version.dll`、`DK4HD_InputFix.asi`、`DK4HD_InputFix.log`；游戏文件不需要恢复。
+- 卸载：删除 `version.dll`、`DK4HD_Fix.asi`、`DK4HD_Fix.ini`、`DK4HD_Fix.log`（仅 `Log=1` 时存在）；游戏文件不需要恢复。
 - 不要同时放多个 ASI Loader；与其他占用 `version.dll` 的 Mod 冲突。
 
 ---
 
 ## 9. 验收清单
 
-本节由仓库 `tools/` 下的脚本执行（PowerShell 5.1+ / Windows x64）。统一形式：
+本节由仓库 `tools/` 下的 Python 脚本执行（Python 3.12+ / Windows x64）。统一形式：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\check_startup.ps1 -GameDir "D:\Games\DK4HD"
+```bat
+python tools\check_startup.py --game-dir "D:\Games\DK4HD"
 ```
 
-`-GameDir` 是游戏根目录（与 `DK4HD_*.exe` 同级）。脚本只启动游戏、读 `DK4HD_InputFix.log`、发点击、读 PresentMon CSV；不修改游戏文件，也不依赖任何反汇编产物。
+`--game-dir` 是游戏根目录（与 `DK4HD_*.exe` 同级）。脚本只启动游戏、读 `<ASI同名>.log`、发点击、读 PresentMon CSV；不修改游戏文件，也不依赖任何反汇编产物。依赖见 `tools/requirements.txt`（`frida`、`psutil`、`Pillow`）。
 
-### 9.1 启动与 Hook —— `tools/check_startup.ps1`
+> 默认 `Log=0` 不会生成日志。9.1 / 9.4 / 9.6 需要用日志或 Frida；9.1 / 9.4 会先备份 INI、临时把 `Log` 设为 1，结束后恢复。9.6 使用 Frida 直接读游戏输入状态，不依赖日志。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\check_startup.ps1 -GameDir "D:\Games\DK4HD"
+### 9.1 启动与 Hook —— `tools/check_startup.py`
+
+```bat
+python tools\check_startup.py --game-dir "D:\Games\DK4HD"
 ```
 
-对 TC/KR/JP/SC 四个 exe 依次启动、等待 8s，逐项检查：进程仍存活、`InitializeASI exe=... base=...`、`qpcFreq=... ticksPerMs=...`（`ticksPerMs >= 1`）、`time=... mouse=... (scan)`（或 `(rva)`）、`mouse poll hook: 1`、`hook time: 0`、`hook PeekMessageA: 0`、`hooked mouse GetDeviceState dev=... vt=... real=...`。
+对 TC/KR/JP/SC 四个 exe 依次启动、等待 8s，逐项检查：进程仍存活、`InitializeASI exe=... base=...`、`config: ...`（键值与默认/当前 INI 一致）、`qpcFreq=... ticksPerMs=...`（`ticksPerMs >= 1`）、`skip intro: ...`、`time=... mouse=... (scan)`（或 `(rva)`）、`release fix: poll+0x42 patched at ...`、`mouse poll hook: 1`、`time hook: 0`、`hook PeekMessageA: 0`、`hooked mouse GetDeviceState dev=... vt=... real=...`。
 
+- 脚本先备份 INI，临时把 `Log` 设为 1；结束后恢复原 INI 和日志。
 - 每个 exe 输出 `[PASS]` / `[FAIL] : missing <项>`；
 - 任一失败返回退出码 1；
 - 全程不应出现错误框、崩溃或退出。
 
-### 9.2 帧时间 —— `tools/measure_frames.ps1`
+### 9.2 帧时间 —— `tools/measure_frames.py`
 
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\measure_frames.ps1 -GameDir "D:\Games\DK4HD"
+```bat
+python tools\measure_frames.py --game-dir "D:\Games\DK4HD"
 ```
 
-流程：启动游戏 → 等 18s（把加载/片头卡顿移出统计窗口）→ PresentMon `--v1_metrics --timed 15` → 统计 `msBetweenPresents`。未指定 `-PresentMon` 时脚本自动把 Intel 官方 PresentMon 2.6.0 x64 下载到 `%TEMP%`。
+流程：启动游戏 → 等 18s（把加载/片头卡顿移出统计窗口）→ PresentMon `--v1_metrics --timed 15` → 统计 `msBetweenPresents`。未指定 `--presentmon` 时脚本自动把 Intel 官方 PresentMon 2.6.0 x64 下载到 `%TEMP%`。
 
 通过条件（脚本内置同样的判定）：
 
@@ -371,20 +514,20 @@ powershell -ExecutionPolicy Bypass -File tools\measure_frames.ps1 -GameDir "D:\G
 - 45–49.5ms 量化带帧占比 < 1%；
 - p50 折算帧率 28–32fps（仍是约 30fps，不解锁 60fps）。
 
-脚本打印 `frames / p5 / p50 / p95 / mean / fps` 与判定行；失败时保留 CSV 路径便于复查。允许 30fps 附近，**不要**为了凑数值去改 33ms tick。
+脚本打印 `frames / p5 / p50 / p95 / max / fps` 与判定行；失败时保留 CSV 路径便于复查。允许 30fps 附近，**不要**为了凑数值去改 33ms tick。
 
-### 9.3 CPU —— `tools/measure_cpu.ps1`
+### 9.3 CPU —— `tools/measure_cpu.py`
 
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\measure_cpu.ps1 -GameDir "D:\Games\DK4HD"
+```bat
+python tools\measure_cpu.py --game-dir "D:\Games\DK4HD"
 ```
 
-启动游戏、等 10s，按 1s 间隔采样 `Win32_PerfFormattedData_PerfProc_Thread`，每个线程取峰值。该计数器以“单核满载 = 100%”为单位，不需要再按核数换算。
+启动游戏、等 10s，用 `psutil` 按 1s 间隔采样每个线程的累计 CPU 时间并换算成峰值。百分比以“单核满载 = 100%”为单位，不需要再按核数换算。
 
 - 通过：最热线程 ≤ **10% 单核**（未修复时该线程 ≈ 100% 单核，特征极明显）；
 - 不要求所有线程都空闲；脚本只打印前 3 个线程。
 
-### 9.4 点击 —— `tools/click_test.ps1`
+### 9.4 点击 —— `tools/click_test.py`
 
 自动验收需要一份**带诊断日志的验收构建**；发布构建必须关闭它：
 
@@ -393,26 +536,61 @@ powershell -ExecutionPolicy Bypass -File tools\measure_cpu.ps1 -GameDir "D:\Game
 - 每次真正把 `rgbButtons[0] |= 0x80` 注入时追加一行：`inject dev=0x... age=<ms>`（`age` = 锁存到注入的毫秒数）；
 - 两个前缀必须可从行首解析；发布构建不得输出这两类行（遵守第 5 节“不要在每个输入帧写日志”）。
 
-```powershell
+```bat
 # 先构建验收版本，脚本会临时替换 .asi，跑完自动恢复原文件
-powershell -ExecutionPolicy Bypass -File tools\click_test.ps1 -GameDir "D:\Games\DK4HD" `
-    -TraceAsi build\DK4HD_InputFix_trace.asi
+python tools\click_test.py --game-dir "D:\Games\DK4HD" `
+    --trace-asi build\DK4HD_Fix_trace.asi
 ```
 
-脚本把游戏窗口置前、光标移到客户区中心，按 5/10/20/40/80ms 各点 12 次（间隔 400ms），再按顺序配对 `latch` / `inject` 行：
+脚本先备份 INI，临时把 `Log` 设为 1；把游戏窗口置前、光标移到客户区中心，按 5/10/20/40/80ms 各点 12 次（间隔 400ms），再按顺序配对 `latch` / `inject` 行：
 
 - 每档 ≥ **10/12** 注入为通过（通常 12/12）；
 - `duplicates` 必须为 **0**（没有 latch 对应的 inject = 重复按下沿）；
 - `latches` 不得少于期望点击数（60）；
 - 打印 `median age`，正常不超过 2 帧（0–47ms）。
 
-不传 `-TraceAsi` 时脚本只发点击，由人工在游戏里判断响应。
+不传 `--trace-asi` 时脚本只发点击，由人工在游戏里判断响应。
+脚本结束后恢复原 INI；测试日志保留供复查（`Log=0` 的默认配置下正常启动不会留下日志）。
 
 ### 9.5 多语言
 
-- `tools/check_startup.ps1` 的四个 exe 必须全部 `(scan)` 命中且 Hook 成功；
-- `tools/click_test.ps1 -Exe DK4HD_sc.exe`（再换 `_kr` / `_jp`）每档 ≥ 10/12；
+- `tools/check_startup.py` 的四个 exe 必须全部 `(scan)` 命中且 Hook 成功；
+- `tools/click_test.py --exe DK4HD_sc.exe`（再换 `_kr` / `_jp`）每档 ≥ 10/12；
+- `tools/click_release_test.py --exe DK4HD_sc.exe`（再换 `_kr` / `_jp`）按下/抬起数量相等；
 - 回退一致性：用一份临时跳过签名扫描的验收构建（例如加宏把扫描短路），`time=` / `mouse=` 地址必须与扫描结果**完全一致**；不一致说明第 1 节 RVA 表或第 2.3 节前缀校验有误。
+
+### 9.6 抬起沿 —— `tools/click_release_test.py`
+
+```bat
+pip install -r tools\requirements.txt
+python tools\click_release_test.py --game-dir "D:\Games\DK4HD" --exe DK4HD_tc.exe --hold-ms 5 --repeats 10
+```
+
+脚本启动游戏、置前，用 Frida 统计按键边沿函数（TC/JP/SC `0x41BB0`，KR `0x41D20`）的返回值：`3` = 按下，`1` = 抬起；只统计左键。
+
+- 通过：`presses == releases == repeats`（默认 10/10）。
+- 对照：把 INI 改为 `ClickLatch=1`、`ClickRelease=0`，重启后再跑；应看到 `releases` 明显少于 `presses`（证明 `ClickRelease` 开关生效）。
+- 脚本不修改 INI/日志；需要 Frida 17+。
+
+### 9.7 配置 / 日志 / 片头 —— `tools/test_config.py`
+
+```bat
+python tools\test_config.py --game-dir "D:\Games\DK4HD"
+```
+
+脚本分阶段执行并**备份/恢复原 INI 与日志**：
+
+1. 删除 INI/日志 → 启动 → 断言 INI 自动生成；`[Fix]` 六个键存在且默认值为 `1/1/1/1/0/0`；日志不存在。
+2. 写入 `Log=1`、`SkipIntro=1`（其余 1）→ 启动 3s → 断言日志存在、`config:` 含 `SkipIntro=1`、`skip intro:` 至少三行 patched；窗口出现且进程存活。
+3. 写入 `Log=0`、删除日志 → 启动 2s → 断言日志不存在。
+4. 结束测试进程，恢复原 INI/日志。
+
+- 退出码 1 表示任一断言失败；失败时保留测试日志/INI。
+- 该脚本只验证配置/日志/片头补丁的安装，不判断画面内容；菜单截图由 9.8 的可选人工步骤或 `tools/test_config.py --screenshot` 输出。
+
+### 9.8 人工画面确认（可选）
+
+在 `SkipIntro=1` 下启动游戏，约 1 秒内应直接出现主菜单（继续 / 新游戏 / 结束游戏），不出现开场动画或 `EVA.DK4` 片头。用 `Win+Shift+S` 或 `python tools\test_config.py --screenshot` 留档即可。
 
 ---
 
@@ -428,6 +606,13 @@ powershell -ExecutionPolicy Bypass -File tools\click_test.ps1 -GameDir "D:\Games
 - ❌ 在 `DllMain` 里创建线程、加载 DLL、初始化 MinHook：放在 `InitializeASI` 中。
 - ❌ 注入后不清 pending：会导致重复按下；`exchange(false)` 后无论是否过期都要清除。
 - ❌ 对非鼠标设备注入 `0x80`：会污染键盘/手柄状态；必须过滤 `self == g_mouseDevice`。
+- ❌ 只开 `ClickLatch` 而不开 `ClickRelease`：锁存只补“按下”，可能让左键卡在按下；默认必须两者都开。
+- ❌ 不校验 `75 4E` 就直接往鼠标轮询 `+0x42` 写 `EB 4E`：版本/签名不符时会改错代码；必须先扫描并校验。
+- ❌ `Log=0` 时仍 `fopen` 日志：会在游戏目录留下空日志；关闭时不要创建/打开/写入。
+- ❌ 硬编码 `DK4HD_Fix.ini` / `.log`：ASI 改名后应使用同基名；必须从 ASI 自身路径推导。
+- ❌ 覆盖已存在的 INI：用户配置会被重置；只在文件不存在时创建默认值。
+- ❌ 把 `SkipIntro=1` 当正式功能或默认开启：它只是测试辅助，正常游玩应保持 0。
+- ❌ 用 UTF-16 INI 配 `GetPrivateProfileIntA`：键会读不到；默认文件用 UTF-8（BOM）+ ASCII 键。
 - ❌ 自己写 / 逆向一个 `version.dll` ASI loader 或手写其转发导出：本文档不描述 loader，交付物只有 `.asi`；loader 用官方预编译二进制。
 - ❌ 修改游戏 exe / 存档 / 资源：该模块只通过 Loader + ASI 运行。
 
@@ -440,4 +625,4 @@ powershell -ExecutionPolicy Bypass -File tools\click_test.ps1 -GameDir "D:\Games
 - PresentMon：Intel，测试工具；遵循其许可证。
 - 游戏本体、存档、素材版权归 Koei Tecmo；本文档与任何实现都不包含它们。
 
-> 独立实现时，建议先写一个最小验证 DLL：只 Hook 时间函数并打印日志，确认四个 exe 都能扫描/启动；再加入鼠标 Hook 和点击锁存；最后跑验收清单。不要一次性修改全部路径。
+> 独立实现时，建议先做签名扫描 + QPC 时间 Hook，确认四个 exe 都能扫描/启动；再加入鼠标 Hook、点击锁存和 `ClickRelease` 抬起沿修复；最后加同名 INI/日志与 `SkipIntro`（默认关），按第 9 节验收。不要一次性修改全部路径。
