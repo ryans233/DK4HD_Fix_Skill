@@ -310,9 +310,24 @@ g++ -shared -m64 -std=c++17 -O2 -DNDEBUG -Iinclude \
 
 ## 8. 安装 / 卸载 / 加载器
 
-- 用 Ultimate-ASI-Loader 的 x64 `version.dll` 作为代理（游戏静态导入 `VERSION.dll`）；`DK4HD_InputFix.asi` 放同目录。
-- `version.dll` 用官方 release 的预编译二进制，不从源码构建，也不自己写代理层；部署时只需复制文件。
-- 不要把 UAL 命名为 `dinput8.dll` 去代理 DirectInput；保持系统 `DINPUT8.dll`，避免代理层介入 COM 接口。
+游戏静态导入 `VERSION.dll`，所以代理 DLL 必须叫 `version.dll`；把 loader 改名成 `dinput8.dll` 会因为导出不匹配直接启动失败。
+
+**`version.dll` 的确切来源**（不编译、不重写、不逆向 loader）：
+
+1. 打开 Ultimate-ASI-Loader 官方发布页：`https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases`
+2. 注意坑：**版本化 release**（如 `v10.0.0`、`v9.7.4`）的 `Ultimate-ASI-Loader_x64.zip` 里**只有 `dinput8.dll`**，没有 `version.dll`。分代理的压缩包只挂在滚动预发布 tag `x64-latest` 下。
+3. 直接下载这个资产：
+   `https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/x64-latest/version-x64.zip`
+   压缩包内是 `version.dll`（约 7MB，x64）与 `version-x64.SHA512`。
+4. 先按包内 `.SHA512` 校验再复制：`certutil -hashfile version.dll SHA512`。滚动 tag 的内容会更新，校验不过就重新下载；不要用来源不明的同名 DLL。
+5. 校验代理导出（应列出转发的版本函数）：
+
+```bash
+objdump -p version.dll | grep -E "GetFileVersionInfo(A|SizeA)"
+```
+
+- `DK4HD_InputFix.asi` 与 `version.dll` 放在游戏根目录（与 `DK4HD_*.exe` 同级）。
+- 保持系统 `DINPUT8.dll` 不变，不要让代理层介入 DirectInput COM 接口。
 - 卸载：删除 `version.dll`、`DK4HD_InputFix.asi`、`DK4HD_InputFix.log`；游戏文件不需要恢复。
 - 不要同时放多个 ASI Loader；与其他占用 `version.dll` 的 Mod 冲突。
 
