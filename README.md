@@ -53,6 +53,7 @@
 ```text
 README.md      # 本说明
 skills.md      # 完整行为规格 / skill
+tools/         # 第 9 节验收脚本（PowerShell）
 ```
 
 第三方组件（Ultimate-ASI-Loader、MinHook、PresentMon）遵循各自许可证。

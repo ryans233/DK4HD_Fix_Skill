@@ -335,39 +335,84 @@ objdump -p version.dll | grep -E "GetFileVersionInfo(A|SizeA)"
 
 ## 9. 验收清单
 
-### 9.1 启动与 Hook
+本节由仓库 `tools/` 下的脚本执行（PowerShell 5.1+ / Windows x64）。统一形式：
 
-对 TC/KR/JP/SC 四个 exe 分别：
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\check_startup.ps1 -GameDir "D:\Games\DK4HD"
+```
 
-- 游戏窗口出现，进程存活；
-- `DK4HD_InputFix.log` 有 `time=... mouse=... (scan)`（或回退日志）、`mouse poll hook: 1`、`hook time: 0`、`hooked mouse GetDeviceState`；
-- 无错误框、无崩溃。
+`-GameDir` 是游戏根目录（与 `DK4HD_*.exe` 同级）。脚本只启动游戏、读 `DK4HD_InputFix.log`、发点击、读 PresentMon CSV；不修改游戏文件，也不依赖任何反汇编产物。
 
-### 9.2 帧时间
+### 9.1 启动与 Hook —— `tools/check_startup.ps1`
 
-PresentMon 15s，前台，`--v1_metrics`：
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\check_startup.ps1 -GameDir "D:\Games\DK4HD"
+```
 
-- `msBetweenPresents` p50 ≈ 33.0–33.1ms；
-- p95 ≈ 35.5–35.8ms；
-- `SyncInterval=1`；
-- 游戏仍约 30fps。
+对 TC/KR/JP/SC 四个 exe 依次启动、等待 8s，逐项检查：进程仍存活、`InitializeASI exe=... base=...`、`qpcFreq=... ticksPerMs=...`（`ticksPerMs >= 1`）、`time=... mouse=... (scan)`（或 `(rva)`）、`mouse poll hook: 1`、`hook time: 0`、`hook PeekMessageA: 0`、`hooked mouse GetDeviceState dev=... vt=... real=...`。
 
-### 9.3 CPU
+- 每个 exe 输出 `[PASS]` / `[FAIL] : missing <项>`；
+- 任一失败返回退出码 1；
+- 全程不应出现错误框、崩溃或退出。
 
-- 最热线程 ≈ 1.5–2.3% 单核（原版 99.7%）。
-- 不要求所有线程都空闲。
+### 9.2 帧时间 —— `tools/measure_frames.ps1`
 
-### 9.4 点击
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\measure_frames.ps1 -GameDir "D:\Games\DK4HD"
+```
 
-- 5/10/20/40/80ms 各 12 次：通常 12/12；5ms 不得低于 10/12。
-- 无重复按下沿。
-- 不注入鼠标移动、不改变光标位置。
+流程：启动游戏 → 等 18s（把加载/片头卡顿移出统计窗口）→ PresentMon `--v1_metrics --timed 15` → 统计 `msBetweenPresents`。未指定 `-PresentMon` 时脚本自动把 Intel 官方 PresentMon 2.6.0 x64 下载到 `%TEMP%`。
+
+通过条件（脚本内置同样的判定）：
+
+- `SyncInterval` 唯一且为 `1`；
+- p50 ∈ **32.0–34.5ms**（原版是 31.25/46.875 双档，p50 落 31.3 左右且大量 46–47ms 帧）；
+- p95 ≤ **40ms**；
+- 45–49.5ms 量化带帧占比 < 1%；
+- p50 折算帧率 28–32fps（仍是约 30fps，不解锁 60fps）。
+
+脚本打印 `frames / p5 / p50 / p95 / mean / fps` 与判定行；失败时保留 CSV 路径便于复查。允许 30fps 附近，**不要**为了凑数值去改 33ms tick。
+
+### 9.3 CPU —— `tools/measure_cpu.ps1`
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\measure_cpu.ps1 -GameDir "D:\Games\DK4HD"
+```
+
+启动游戏、等 10s，按 1s 间隔采样 `Win32_PerfFormattedData_PerfProc_Thread`，每个线程取峰值。该计数器以“单核满载 = 100%”为单位，不需要再按核数换算。
+
+- 通过：最热线程 ≤ **10% 单核**（未修复时该线程 ≈ 100% 单核，特征极明显）；
+- 不要求所有线程都空闲；脚本只打印前 3 个线程。
+
+### 9.4 点击 —— `tools/click_test.ps1`
+
+自动验收需要一份**带诊断日志的验收构建**；发布构建必须关闭它：
+
+- 编译宏 `-DDK4HD_TRACE_CLICKS`；
+- 每次记录到 `WM_LBUTTONDOWN` / `WM_LBUTTONDBLCLK` 追加一行：`latch msg=0x0201 hwnd=...`；
+- 每次真正把 `rgbButtons[0] |= 0x80` 注入时追加一行：`inject dev=0x... age=<ms>`（`age` = 锁存到注入的毫秒数）；
+- 两个前缀必须可从行首解析；发布构建不得输出这两类行（遵守第 5 节“不要在每个输入帧写日志”）。
+
+```powershell
+# 先构建验收版本，脚本会临时替换 .asi，跑完自动恢复原文件
+powershell -ExecutionPolicy Bypass -File tools\click_test.ps1 -GameDir "D:\Games\DK4HD" `
+    -TraceAsi build\DK4HD_InputFix_trace.asi
+```
+
+脚本把游戏窗口置前、光标移到客户区中心，按 5/10/20/40/80ms 各点 12 次（间隔 400ms），再按顺序配对 `latch` / `inject` 行：
+
+- 每档 ≥ **10/12** 注入为通过（通常 12/12）；
+- `duplicates` 必须为 **0**（没有 latch 对应的 inject = 重复按下沿）；
+- `latches` 不得少于期望点击数（60）；
+- 打印 `median age`，正常不超过 2 帧（0–47ms）。
+
+不传 `-TraceAsi` 时脚本只发点击，由人工在游戏里判断响应。
 
 ### 9.5 多语言
 
-- 四个 exe 的签名扫描都命中；
-- 5ms 点击各至少 10/12；
-- 回退 RVA 与扫描结果一致。
+- `tools/check_startup.ps1` 的四个 exe 必须全部 `(scan)` 命中且 Hook 成功；
+- `tools/click_test.ps1 -Exe DK4HD_sc.exe`（再换 `_kr` / `_jp`）每档 ≥ 10/12；
+- 回退一致性：用一份临时跳过签名扫描的验收构建（例如加宏把扫描短路），`time=` / `mouse=` 地址必须与扫描结果**完全一致**；不一致说明第 1 节 RVA 表或第 2.3 节前缀校验有误。
 
 ---
 
