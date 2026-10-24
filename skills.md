@@ -18,12 +18,17 @@
 
 ## 1. 目标产物
 
-一个 x64 ASI 插件：
+**唯一需要实现的交付物**是一个 x64 ASI 插件：
 
 ```text
-version.dll        # Ultimate-ASI-Loader x64（或兼容 ASI Loader 的代理 DLL）
+version.dll        # 部署依赖：Ultimate-ASI-Loader x64 预编译二进制，原样使用，不实现
 DK4HD_InputFix.asi # 独立实现的 x64 DLL（名称可自定；下同）
 ```
+
+- `version.dll` **不是**实现目标。直接取 Ultimate-ASI-Loader 官方 release 的 x64 `version.dll` 复制到游戏根目录；不需要自己编译、重写或逆向 loader。
+- **不要**自行实现 ASI loader / `version.dll` 代理：本文档未提供导出转发、ASI 目录扫描、加载时序等规格，loader 因此不可按本文档验收，也不在独立实现范围内。
+- 若环境里已有其他**预编译** ASI loader（其他代理 DLL 名），可直接复用；这属于部署选择，不是实现任务。
+- 成功判定只看 `DK4HD_InputFix.asi` 的行为（第 2 节 + 第 9 节）；loader 只需满足“游戏能加载它、它能发现并加载 `.asi`”这一既有事实。
 
 安装：两个文件放在游戏根目录（与 `DK4HD_tc.exe` 同级）。插件导出：
 
@@ -306,6 +311,7 @@ g++ -shared -m64 -std=c++17 -O2 -DNDEBUG -Iinclude \
 ## 8. 安装 / 卸载 / 加载器
 
 - 用 Ultimate-ASI-Loader 的 x64 `version.dll` 作为代理（游戏静态导入 `VERSION.dll`）；`DK4HD_InputFix.asi` 放同目录。
+- `version.dll` 用官方 release 的预编译二进制，不从源码构建，也不自己写代理层；部署时只需复制文件。
 - 不要把 UAL 命名为 `dinput8.dll` 去代理 DirectInput；保持系统 `DINPUT8.dll`，避免代理层介入 COM 接口。
 - 卸载：删除 `version.dll`、`DK4HD_InputFix.asi`、`DK4HD_InputFix.log`；游戏文件不需要恢复。
 - 不要同时放多个 ASI Loader；与其他占用 `version.dll` 的 Mod 冲突。
@@ -362,6 +368,7 @@ PresentMon 15s，前台，`--v1_metrics`：
 - ❌ 在 `DllMain` 里创建线程、加载 DLL、初始化 MinHook：放在 `InitializeASI` 中。
 - ❌ 注入后不清 pending：会导致重复按下；`exchange(false)` 后无论是否过期都要清除。
 - ❌ 对非鼠标设备注入 `0x80`：会污染键盘/手柄状态；必须过滤 `self == g_mouseDevice`。
+- ❌ 自己写 / 逆向一个 `version.dll` ASI loader 或手写其转发导出：本文档不描述 loader，交付物只有 `.asi`；loader 用官方预编译二进制。
 - ❌ 修改游戏 exe / 存档 / 资源：该模块只通过 Loader + ASI 运行。
 
 ---

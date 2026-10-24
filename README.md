@@ -27,12 +27,13 @@
 3. 指定目标环境：
    - Windows x64
    - 游戏 `DK4HD_tc.exe` / `DK4HD_kr.exe` / `DK4HD_jp.exe` / `DK4HD_sc.exe`
-   - MSYS2 MinGW-w64 + Ultimate-ASI-Loader + MinHook
+   - MSYS2 MinGW-w64 + MinHook（需从源码构建）
+   - Ultimate-ASI-Loader：直接用官方 x64 预编译 `version.dll`，不需要也不应该自己实现 ASI loader
 4. 让 LLM 按文档顺序实现：
    - 先做时间函数扫描 + QPC Hook，验证四个 exe 可启动；
    - 再加鼠标轮询 Hook 和 `GetDeviceState` 点击锁存；
    - 最后跑文档中的验收清单。
-5. 构建产物放到游戏根目录：
+5. 构建产物 `.asi` 与预编译 loader 一起放到游戏根目录：
    ```text
    version.dll
    DK4HD_InputFix.asi
@@ -42,6 +43,7 @@
 ## 适用边界
 
 - 单机游戏互操作性修复；不绕过 DRM、不修改游戏文件、不包含游戏资源。
+- 实现目标只有 `DK4HD_InputFix.asi`。`version.dll` 是 Ultimate-ASI-Loader 的预编译部署依赖，不属于实现范围；不要自己写 ASI loader 或代理转发层。
 - 游戏仍约 30 FPS；该规格不包含 60 FPS 解锁。
 - 连续点击偶发“按下未弹起”属于另一个独立问题，不在本规格范围内。
 - 对游戏进行互操作性修改可能受 EULA、当地法律或平台条款限制；使用前请自行确认合法性。
