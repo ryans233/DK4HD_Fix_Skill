@@ -42,12 +42,12 @@ extern "C" __declspec(dllexport) void InitializeASI(void);
 
 | exe | 时间函数 RVA | 鼠标轮询 RVA |
 |---|---|---|
-| `DK4HD_tc.exe` | `0xD6630` | `0x2B5B10` |
-| `DK4HD_kr.exe` | `0xD8B10` | `0x2BD7F0` |
-| `DK4HD_jp.exe` | `0xD6330` | `0x2B5830` |
-| `DK4HD_sc.exe` | `0xD62F0` | `0x2B57D0` |
+| `DK4HD_tc.exe` | `0xD6630` | `0x2B5BC0` |
+| `DK4HD_kr.exe` | `0xD8B10` | `0x2BD8A0` |
+| `DK4HD_jp.exe` | `0xD6330` | `0x2B58E0` |
+| `DK4HD_sc.exe` | `0xD62F0` | `0x2B5880` |
 
-> RVA 基于 ImageBase `0x140000000`；运行时地址 = exe 模块基址 + RVA。优先扫描签名，RVA 表仅作回退。
+> RVA 基于 ImageBase `0x140000000`；运行时地址 = exe 模块基址 + RVA。优先扫描签名，RVA 表仅作回退。表内值为函数入口，回退时仍必须通过第 2.3 节的前缀校验；四条 RVA 必须等于签名扫描得到的地址（第 9.5 节）。
 
 ---
 
