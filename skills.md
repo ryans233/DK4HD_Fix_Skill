@@ -43,14 +43,14 @@ extern "C" __declspec(dllexport) void InitializeASI(void);
 
 支持的 exe：
 
-| exe | 时间函数 RVA | 鼠标轮询 RVA |
-|---|---|---|
-| `DK4HD_tc.exe` | `0xD6630` | `0x2B5BC0` |
-| `DK4HD_kr.exe` | `0xD8B10` | `0x2BD8A0` |
-| `DK4HD_jp.exe` | `0xD6330` | `0x2B58E0` |
-| `DK4HD_sc.exe` | `0xD62F0` | `0x2B5880` |
+| exe | 时间函数 RVA | 鼠标轮询 RVA（1.0.1） | 鼠标轮询 RVA（1.0.2） |
+|---|---|---|---|
+| `DK4HD_tc.exe` | `0xD6630` | `0x2B5B10` | `0x2B5BC0` |
+| `DK4HD_kr.exe` | `0xD8B10` | `0x2BD7F0` | `0x2BD8A0` |
+| `DK4HD_jp.exe` | `0xD6330` | `0x2B5830` | `0x2B58E0` |
+| `DK4HD_sc.exe` | `0xD62F0` | `0x2B57D0` | `0x2B5880` |
 
-> RVA 基于 ImageBase `0x140000000`；运行时地址 = exe 模块基址 + RVA。优先扫描签名，RVA 表仅作回退。表内值为函数入口，回退时仍必须通过第 2.3 节的前缀校验；四条 RVA 必须等于签名扫描得到的地址（第 9.5 节）。
+> RVA 基于 ImageBase `0x140000000`；运行时地址 = exe 模块基址 + RVA。优先扫描签名，RVA 表仅作回退。表内值为函数入口，回退时仍必须通过第 2.3 节的前缀校验。时间函数两版 RVA 相同；鼠标轮询在 1.0.1/1.0.2 间后移 `0xB0`，回退时按 exe 名依次尝试两个版本，命中并通过校验的那个才使用；全部失败才安全退出（第 9.5 节）。
 
 ---
 
@@ -316,6 +316,7 @@ Log=0
 
 - `DK4HD_tc.exe` / `DK4HD_kr.exe` / `DK4HD_jp.exe` / `DK4HD_sc.exe`，1.0.1 / 1.0.2。
 - 不做 exe 名 gate；是否启用只看 `60fps=1` 和 Hook 是否全部成功。
+- Fast60 不要求 `FramePacing=1`：`60fps=1` 且时间 Hook 成功时，Fast60 的时间源返回 2× QPC；`FramePacing=0` 只影响 Fast60 关闭时的 30Hz 路径（2.1 的原值返回）。不要在 Fast60 启用条件里额外要求 `FramePacing=1`。
 - 时间函数仍用 2.3 的签名扫描；1.0.1 与 1.0.2 的时间函数 RVA 相同。鼠标轮询仍由签名扫描定位。
 
 **配置**
@@ -445,7 +446,7 @@ fast60 enabled at startup (global 2x clock, ~2x game speed)
 失败时写：
 
 ```text
-fast60 requested but not enabled (key=... present=... time=... enable=...)
+fast60 requested but not enabled (key=... peek=... present=... time=... enable=...)
 ```
 
 **限制**
@@ -706,7 +707,7 @@ python tools\click_test.py --game-dir "D:\Games\DK4HD" `
 - `tools/check_startup.py` 的四个 exe 必须全部 `(scan)` 命中且 Hook 成功；
 - `tools/click_test.py --exe DK4HD_sc.exe`（再换 `_kr` / `_jp`）每档 ≥ 10/12；
 - `tools/click_release_test.py --exe DK4HD_sc.exe`（再换 `_kr` / `_jp`）按下/抬起数量相等；
-- 回退一致性：用一份临时跳过签名扫描的验收构建（例如加宏把扫描短路），`time=` / `mouse=` 地址必须与扫描结果**完全一致**；不一致说明第 1 节 RVA 表或第 2.3 节前缀校验有误。
+- 回退一致性：用一份临时跳过签名扫描的验收构建（例如加宏把扫描短路），`time=` / `mouse=` 地址必须与**对应版本**的签名扫描结果完全一致（1.0.1 用 `0x2B5B10` 等，1.0.2 用 `0x2B5BC0` 等）；不一致说明第 1 节 RVA 表或第 2.3 节前缀校验有误。
 
 ### 9.6 抬起沿 —— `tools/click_release_test.py`
 
@@ -780,7 +781,7 @@ PresentMon（默认启用；`--no-presentmon` 仅做功能检查）在第一个�
 - `warmup` 默认 8 秒，建议至少 8 秒；采样时必须已经在主菜单（测试 INI 的 `SkipIntro=1`）；
 - 任一 Hook 失败、标题不切换、F10 后失焦、启动崩溃、第一个选中 exe 的 PresentMon 采样失败或性能门禁不达标 → 失败。
 
-> 本脚本是 Fast60 的权威验收版本：功能项与主项目 `test/fast60_test.py` 一致，并额外包含 `CpuIdle=1` 的 PresentMon 性能门禁（主项目脚本只做功能/记录）；`--presentmon` 未指定时会自动下载 Intel PresentMon 2.6.0。
+> 本脚本是 Fast60 的权威验收版本；主项目 `test/fast60_test.py` 已同步相同的临时 INI 与 `p50/p95/fps` 性能门禁。`--presentmon` 未指定时会自动下载 Intel PresentMon 2.6.0。
 
 ---
 
