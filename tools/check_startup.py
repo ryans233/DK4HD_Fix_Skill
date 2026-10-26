@@ -55,13 +55,18 @@ def main():
             stop_game(proc)
             log = read_text(log_path, timeout=2.0)
 
+            config_line = next(
+                (ln for ln in log.splitlines() if ln.startswith("config: ")), "")
             checks = {
                 "process alive": alive,
                 "InitializeASI line": bool(re.search(
                     rf"(?m)^InitializeASI exe={re.escape(name)} base=0x?[0-9a-fA-F]+", log)),
-                "config line": bool(re.search(
-                    r"(?m)^config: ini=.* FramePacing=1 CpuIdle=1 ClickLatch=1 "
-                    r"ClickRelease=1 SkipIntro=0 Log=1", log)),
+                "config line": bool(config_line) and all(
+                    f"{key}={value}" in config_line
+                    for key, value in (
+                        ("FramePacing", 1), ("CpuIdle", 1), ("ClickLatch", 1),
+                        ("ClickRelease", 1), ("SkipIntro", 0), ("Log", 1), ("60fps", 0),
+                    )),
                 "qpc init": bool(re.search(r"qpcFreq=\d+ ticksPerMs=[1-9]\d*", log)),
                 "skip intro state": bool(re.search(r"(?m)^skip intro: disabled\r?$", log)),
                 "time/mouse located": bool(re.search(

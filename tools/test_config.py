@@ -134,7 +134,13 @@ def main():
         if not log_text:
             fail("phase2: log missing with Log=1")
         else:
-            if re.search(r"(?m)^config: .*SkipIntro=1 Log=1", log_text):
+            config_line = next(
+                (ln for ln in log_text.splitlines() if ln.startswith("config: ")), "")
+            expected_fields = (
+                "FramePacing=1", "CpuIdle=1", "ClickLatch=1", "ClickRelease=1",
+                "SkipIntro=1", "Log=1", "60fps=0",
+            )
+            if all(field in config_line for field in expected_fields):
                 passed("phase2: config line")
             else:
                 fail("phase2: config line missing/wrong")
