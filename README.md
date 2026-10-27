@@ -32,13 +32,14 @@
    - 游戏 `DK4HD_tc.exe` / `DK4HD_kr.exe` / `DK4HD_jp.exe` / `DK4HD_sc.exe`
    - MSYS2 MinGW-w64 + MinHook（需从源码构建）
    - Ultimate-ASI-Loader：直接用官方 x64 预编译 `version.dll`，不需要也不应该自己实现 ASI loader
-4. 让 LLM 按文档顺序实现：
-   - 时间函数扫描 + QPC/1ms 时间修复；
-   - 鼠标轮询 Hook + `GetDeviceState` 点击锁存；
-   - `poll+0x42` 抬起沿修复；
-   - 同名 INI + 可选日志；
-   - `SkipIntro`（测试辅助，默认关闭）；
-   - 可选实验性 `60fps=1`：Fast60 + 标题栏 FPS + F10 切换 + 方向键修复。
+4. 让 LLM 按文档顺序实现（对应 `skills.md` §2.1–2.7）：
+   - `2.1` 多语言签名扫描（时间函数 + 鼠标轮询，含 RVA 回退与前置校验）；
+   - `2.2` QPC 帧节奏 + 1ms 节流；
+   - `2.3` 鼠标轮询 Hook + `GetDeviceState` 点击锁存；
+   - `2.4` `poll+0x42` 抬起沿修复；
+   - `2.5` `SkipIntro`（测试辅助，默认关闭）；
+   - `2.6` 可选实验性 `60fps=1`：Fast60 + 标题栏 FPS + F10 切换 + 方向键修复；
+   - `2.7` 同名 INI + 可选日志。
 5. 构建产物 `.asi` 与预编译 loader 一起放到游戏根目录：
 
    ```text
@@ -47,7 +48,7 @@
    DK4HD_Fix.ini   # 首次启动自动生成
    ```
 
-   默认除 `SkipIntro`、`Log` 外全部启用；`Log=0` 时不生成日志。启动游戏后按第 9 节验收。
+   默认除 `SkipIntro`、`Log`、`60fps` 外全部启用；`Log=0` 时不生成日志。启动游戏后按第 9 节验收。
 
 ## 适用边界
 

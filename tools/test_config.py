@@ -4,7 +4,7 @@
     python tools/test_config.py --game-dir "D:\\Games\\DK4HD"
 
 Phases:
-  1. no INI/log -> default INI is created (six keys, Chinese comments), no log
+  1. no INI/log -> default INI is created (seven keys, Chinese comments), no log
   2. Log=1, SkipIntro=1 -> log exists, config line and three skip patches
   3. Log=0 -> no log file is created
 The original INI/log are restored afterwards.
@@ -94,6 +94,7 @@ def main():
                 "clickrelease": 1,
                 "skipintro": 0,
                 "log": 0,
+                "60fps": 0,
             }
             for key, want in expected.items():
                 got = values.get(key)
