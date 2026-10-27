@@ -52,7 +52,7 @@ extern "C" __declspec(dllexport) void InitializeASI(void);
 
 > RVA 基于 ImageBase `0x140000000`；运行时地址 = exe 模块基址 + RVA。优先扫描签名，RVA 表仅作回退。表内值为函数入口，回退时仍必须通过第 2.1 节的前缀校验。时间函数两版 RVA 相同；鼠标轮询在 1.0.1/1.0.2 间后移 `0xB0`，回退时按 exe 名依次尝试两个版本，命中并通过校验的那个才使用；全部失败才安全退出（第 9.5 节）。
 
-> **建议实现顺序**：先做多语言签名扫描（2.1），确认四个 exe 都能定位；再接 QPC 时间 Hook 的帧节奏（2.2）；然后两个鼠标点击修复（2.3 锁存、2.4 抬起沿）；随后加入 `SkipIntro`（2.5，默认关）与实验性 Fast60（2.6）；最后接同名 INI/日志（2.7）。Fast60 必须默认关闭，且不要与“保持原时长”的补偿 Hook 混用。
+> **建议实现顺序**：先做多语言签名扫描（2.1），确认四个 exe 都能定位；再接 QPC 时间 Hook 的帧节奏（2.2）；然后两个鼠标点击修复（2.3 锁存、2.4 抬起沿）；随后加入 `SkipIntro`（2.5，默认关）与实验性 Fast60（2.6）；再接同名 INI/日志（2.7）；最后做设备枚举缓存（2.8）。Fast60 必须默认关闭，且不要与“保持原时长”的补偿 Hook 混用。
 
 ---
 
@@ -412,6 +412,7 @@ fast60 requested but not enabled (key=... peek=... present=... time=... enable=.
 | `CpuIdle` | 1 | 时间函数 1ms 节流 |
 | `ClickLatch` | 1 | 短点击锁存 |
 | `ClickRelease` | 1 | 抬起沿修复 |
+| `EnumCache` | 1 | 设备枚举缓存：复用首次 `IDirectInput8::EnumDevices` 结果 |
 | `SkipIntro` | 0 | 测试用：跳过片头/标题，直接进主菜单 |
 | `Log` | 0 | 是否输出日志；0 = 不创建/不写入 |
 | `60fps` | 0 | 实验性 Fast60 + 标题栏 FPS；1 = 开启，F10 实时切换 Fast60/30Hz（不修改 INI） |
@@ -430,6 +431,9 @@ CpuIdle=1
 ClickLatch=1
 ; 抬起沿修复：绕过鼠标轮询的空闲快速路径，避免“只按下、不弹起”
 ClickRelease=1
+; 设备枚举缓存：复用首次 IDirectInput8::EnumDevices 结果，消除每约 2.6 秒一次的
+; 445ms HID 全量枚举卡顿（代价：运行中插拔手柄不会被识别）
+EnumCache=1
 ; 测试用：跳过片头动画和标题画面，直接进入主菜单（默认关闭）
 SkipIntro=0
 ; 是否输出日志：0 = 不生成/不写入 <ASI同名>.log（默认），1 = 生成
@@ -445,7 +449,7 @@ Log=0
 - `Log=1`：以 `"w"` 截断打开并写入。
 - 日志至少包含：
   - `InitializeASI exe=<basename> base=<ptr> asi=<path>`
-  - `config: ini=<path> log=<path> FramePacing=... CpuIdle=... ClickLatch=... ClickRelease=... SkipIntro=... Log=... 60fps=...`（`60fps` 字段用于 Fast60 验收；顺序不限）
+  - `config: ini=<path> log=<path> FramePacing=... CpuIdle=... ClickLatch=... ClickRelease=... EnumCache=... SkipIntro=... Log=... 60fps=...`（`60fps` 字段用于 Fast60 验收；顺序不限）
   - 各 Hook/补丁的状态（找到/未找到、成功/失败）。
 - 不要在每个输入帧写日志；日志只用于启动/安装诊断。
 - 验收构建可以额外输出 `latch` / `inject` 行（见 9.4），但发布构建必须遵守 `Log` 开关。
@@ -457,6 +461,55 @@ Log=0
   - `Log=1` → 日志出现且包含生效配置；
   - `SkipIntro=1` → 日志出现三处 skip 补丁；
   - `Log=0` → 不创建日志。
+
+---
+
+### 2.8 设备枚举缓存（`EnumCache`）
+
+**现象与根因**
+
+- 游戏在**自己是前台窗口**时，每约 **2.6 秒**调用一次 `IDirectInput8::EnumDevices`（`dwDevType=0x4`＝`DI8DEVCLASS_GAMECTRL`，`dwFlags=0x1`＝`DIEDFL_ATTACHEDONLY`），用于发现手柄。
+- 这一轮走的是"枚举全部 HID 设备、逐个打开并取报告描述符"的路径，成本 **∝ 该进程能看到的 HID 设备数**：单设备实测 20–62ms（`HidD_GetPreparsedData` 50–62ms ×2 + `DeviceIoControl` 20–21ms）。HID 接口多的机器上整轮可达数百毫秒（观测到 445–450ms 量级），设备少的机器可能只有几毫秒。
+- 因此"某个 exe 名字不卡"只可能是**环境差异**：系统里的第三方 HID 过滤工具若对某个 exe 隐藏了这些设备，该进程能枚举到的设备数为 0，没有设备需要逐个打开，耗时自然接近 0。没有这类过滤的机器上，四个语言的 exe 都会付这份成本，本缓存对所有人都有意义。
+- 不要按"每请求固定罚时/按路径放行"理解：耗时随可见设备数量变化。反例：手柄可见时枚举到设备后游戏即停止轮询，只付一次性 ~141ms；手柄不可见时才每轮付整轮成本。
+- 该轮询跑在帧线程上，因此设备多的机器上每 2.6 秒会掉一整轮（观测 445–450ms 量级；Fast60 2× 时钟下约 337ms）：PresentMon 表现为“每 61 帧一个数百毫秒的洞”，标题栏 FPS 从 58 掉到 39–40。卡顿期间进程 CPU ≈1.6%、`msGPUActive` ≈0.3ms —— 纯阻塞，不是算力或 GPU 问题。
+- **只在有焦点时发生**：失焦后游戏停止该轮询（失焦采样 0 次卡顿、`fg_ratio=0`）。
+- “只改 exe 文件名就恢复 58 FPS”与 exe 字节无关，是环境对该进程隐藏了这些设备、可枚举数为 0 的结果；不要从 exe 差异里找原因。补丁不依赖这类工具是否存在，也不要求在它里面做配置。
+
+**要求的行为**
+
+让这轮枚举只**真正执行一次**，之后复用结果：
+
+1. Hook `dinput8.dll!DirectInput8Create`（MinHook 即可），在返回后取到 `IDirectInput8*`；
+2. **原地**改其虚表槽位 **4**（`EnumDevices`；槽位 0–2 是 IUnknown，3 是 `CreateDevice`），保存原函数指针；
+3. 首次调用：用一个包装回调捕获设备实例（按 `dwSize` 复制进静态表）后原样转发给调用方回调，再调用原函数；
+4. 之后按 **(`dwDevType`, `dwFlags`)** 命中缓存时，逐个把缓存 blob 传给调用方回调并直接返回 `DI_OK`，**不再进入真实枚举**。
+
+约束：
+
+- blob 上限取 `>= sizeof(DIDEVICEINSTANCEW)`（建议 1104 字节）；复制长度 `min(inst->dwSize, 上限)`；`dwSize < 4` 视为无效丢弃（`DIDEVICEINSTANCEA` 只有 572 字节，不能按固定长度盲拷）。
+- 缓存容量建议 4 个键 × 每键 16 个设备；表满时**回落**到真实枚举，不覆盖已有键。
+- 加一个重入标志：重入或表满时直接调用原函数，并保证所有分支都释放该标志。
+- 回调返回 `DIENUM_STOP` 时立即停止回放。
+- 首次调用仍会慢一次（约 440ms），发生在进入主菜单前，属可接受成本。
+
+已知代价与边界：
+
+- 运行中热插拔 DInput 手柄不再被发现（重启游戏即可）。XInput 手柄不受影响：它走 `XInputGetState`（`XINPUT1_3.dll` 序号 2、`XInputSetState` 序号 3），与 `EnumDevices` 无关。
+- 手柄对某个 exe **可见**时，游戏第一次枚举到设备后就**停止**这轮轮询：日志只有 `captured` 没有 `replayed`，也不会再有卡顿——这是正常态，不是回归。
+
+**日志（`Log=1`）**
+
+```text
+dinput enum hook: <MH_STATUS>
+hooked IDirectInput8::EnumDevices at <ptr>
+dinput enum: captured <n> device(s) type=0x<dwDevType> flags=0x<dwFlags> in <ms> ms, cached
+dinput enum: replayed <n> device(s) type=0x<dwDevType> flags=0x<dwFlags>
+```
+
+**验收**
+
+第 9.10 节。
 
 ---
 
@@ -564,6 +617,11 @@ hooked mouse GetDeviceState dev=... vt=... real=...
 | 主循环 tick | 33ms（0x21） |
 | 鼠标轮询空闲快速路径跳转 | `+0x42`，`75 4E` → `EB 4E` |
 | `ClickLatch` / `ClickRelease` 默认 | 1 / 1（必须成对开启） |
+| `IDirectInput8::EnumDevices` 虚表槽位 | `4`（0–2 IUnknown，3 `CreateDevice`） |
+| `DIDEVICEINSTANCEW` 大小 | 1100 字节；缓存 blob 上限取 `>=` 该值（建议 1104） |
+| 设备枚举缓存键 / 容量 | `(dwDevType, dwFlags)` / 建议 4 键 × 16 设备 |
+| 游戏手柄轮询参数 / 周期 | `dwDevType=0x4`、`dwFlags=0x1`；约 2.6s，仅前台 |
+| `EnumCache` 默认 | 1 |
 | `SkipIntro` 默认 | 0 |
 | `Log` 默认 | 0 |
 | `60fps` 默认 | 0（实验性；F10 只切换运行态，不写 INI） |
@@ -786,9 +844,37 @@ PresentMon（默认启用；`--no-presentmon` 仅做功能检查）在第一个�
 
 ---
 
+### 9.10 设备枚举缓存 —— `tools/enumcache_test.py`
+
+```bat
+python tools\enumcache_test.py --game-dir "E:\Games\DK4HD"
+python tools\enumcache_test.py --game-dir "E:\Games\DK4HD" --exe DK4HD_sc.exe
+python tools\enumcache_test.py --game-dir "E:\Games\DK4HD" --no-ab --no-presentmon
+```
+
+脚本启动先**检测外部 HID 过滤工具**（内核驱动文件、服务状态、客户端/看护进程、安装目录、配置键是否可读），命中时打印一段说明并把结果写入 `out/enumcache_results.json` 的 `environment`；检测只提示，不判失败。
+
+运行前必须关闭已运行的游戏实例（脚本会检测到并以 `FAIL` 中止，避免与用户正在玩的进程抢窗口/PresentMon）。临时 INI 写入 `FramePacing=1`、`CpuIdle=1`、`ClickLatch=1`、`ClickRelease=1`、`SkipIntro=1`、`Log=1`、`60fps=0`、`EnumCache=<0|1>`，跑完恢复原文件。
+
+每个 exe 的缓存运行（`EnumCache=1`）检查：
+
+- 日志含 `dinput enum hook: 0`、`hooked IDirectInput8::EnumDevices`、`dinput enum: captured … cached`；
+- 日志含 `dinput enum: replayed …`，**或** `type=0x4` 捕获到 ≥1 个设备（游戏已停止轮询，无需回放）；
+- 前台 PresentMon 采样窗内没有 `>100ms` 的 `msBetweenPresents`，且前台占比 `fg_ratio >= 0.9`。
+
+A/B（默认最多尝试 2 个 exe，出现慢基线即停）：同一 exe 用 `EnumCache=0` 复测。
+
+- 基线出现 `>100ms` 帧（说明该环境 HID 枚举确实慢）→ 缓存运行必须为 0 次，否则 FAIL；
+- 基线没有 `>100ms` 帧（exe 对设备可见，或 HID 栈本来就快）→ 该项记 N/A，不判失败；
+- 手柄对该 exe 可见时跳过 A/B 并打印原因。
+
+通过标准：四语言功能检查全部通过；`EnumCache=1` 采样窗无 `>100ms` 帧；能复现慢基线的机器上 A/B 通过。`--no-presentmon` 只用于排查，不能作为最终验收。
+
+---
+
 ## 10. 常见错误（不要这样做）
 
-- ❌ Hook `DirectInput8Create` 并包装返回的 `IDirectInput8` / `CreateDevice`：容易破坏 DInput 初始化。
+- ❌ 为了点击锁存去包装/替换 `IDirectInput8` 或它的 `CreateDevice`：会破坏 DInput 初始化。`EnumCache`（2.8）只 hook `DirectInput8Create` 取指针，并**原地**改虚表槽位 4（`EnumDevices`），不改 `CreateDevice`、不复制虚表。
 - ❌ 复制 DInput 虚表并替换设备 vptr：`Acquire`/`SetCooperativeLevel` 可能返回 `E_INVALIDARG`；失焦后鼠标无法恢复。**只原地改 `GetDeviceState` 槽位。**
 - ❌ 用 18 字节 RTC 前缀搜索时间函数：会命中 2000+ 次；必须用 `div 100000000h` 唯一签名。
 - ❌ 只硬编码 TC RVA：KR/JP/SC 会失效；必须扫描 + 回退表 + 校验。
@@ -805,6 +891,9 @@ PresentMon（默认启用；`--no-presentmon` 仅做功能检查）在第一个�
 - ❌ 覆盖已存在的 INI：用户配置会被重置；只在文件不存在时创建默认值。
 - ❌ 把 `SkipIntro=1` 当正式功能或默认开启：它只是测试辅助，正常游玩应保持 0。
 - ❌ 用 UTF-16 INI 配 `GetPrivateProfileIntA`：键会读不到；默认文件用 UTF-8（BOM）+ ASCII 键。
+- ❌ 设备枚举缓存只按 `dwDevType` 建键、忽略 `dwFlags`：`ATTACHEDONLY` 与非过滤调用会互相污染。
+- ❌ 捕获设备实例时不看 `dwSize` 就定长拷：`DIDEVICEINSTANCEA` 只有 572 字节，会读到越界内存。
+- ❌ 把每 2.6s 的 445ms 卡顿当成 GPU/驱动问题：它发生在 `IDirectInput8::EnumDevices`，期间 `msGPUActive` 只有约 0.3ms、进程 CPU 约 1.6%。
 - ❌ 自己写 / 逆向一个 `version.dll` ASI loader 或手写其转发导出：本文档不描述 loader，交付物只有 `.asi`；loader 用官方预编译二进制。
 - ❌ 修改游戏 exe / 存档 / 资源：该模块只通过 Loader + ASI 运行。
 - ❌ 在 Fast60 全局 ×2 的同时仍安装 UI `a3×2`、事件等待帧数×2、TimedWait 毫秒×2、淡入淡出 count×2：会双重补偿，得到 4× 或混合时钟。Fast60 不做这些补偿。
