@@ -21,7 +21,7 @@
 
 `skills.md` 是写给 LLM 的实现规格，把表中项目拆成**可验证的行为规格**：Hook 哪个函数、用哪段字节签名定位、虚表改哪个槽位、常量是多少、初始化顺序、INI/日志规则、每项怎么验收。照着做完就产出一个 x64 ASI 插件。它不是设计综述也不是教程，而是“做到什么程度才算完成”的判据。
 
-文档只包含接口事实、常量、签名和行为规格，不包含游戏代码、资源或实现源码。
+`skills.md` 只包含接口事实、常量、签名和行为规格，不包含游戏代码、资源或实现源码。
 
 ## 如何使用
 
@@ -62,6 +62,16 @@
 - `EnumCache=1` 的代价：运行中热插拔 DInput 手柄不被识别（重启即可）；XInput 手柄走 `XInputGetState`，不受影响。
 - `Log=0` 是默认值：不创建、不写入同名日志；`Log=1` 才输出启动诊断日志。
 - 对游戏进行互操作性修改可能受 EULA、当地法律或平台条款限制；使用前请自行确认合法性。
+
+## 技术实现
+
+- **帧节奏**：Hook 时间函数，用 `QueryPerformanceCounter` 毫秒值替换 `GetTickCount64` 低 32 位；同一线程 1ms 内重复调用时 `Sleep(1)`。
+- **CPU 忙等 / 定时器周期**：`CpuIdle=1` 时 `timeBeginPeriod(1)`，让 `Sleep(1)` 真正睡 1ms；该周期覆盖整个 Hook 生命周期，在 `DLL_PROCESS_DETACH` 用 `timeEndPeriod(1)` 配对释放（仅 `timeBeginPeriod` 返回 `TIMERR_NOERROR` 时），运行中 `FreeLibrary` 也会释放。
+- **点击锁存**：Hook `PeekMessageA` 捕获 `WM_LBUTTONDOWN` / `WM_LBUTTONDBLCLK`，在下一次 `GetDeviceState` 给 `DIMOUSESTATE.rgbButtons[0]` 置位一次。
+- **抬起沿修复**：鼠标轮询 `+0x42` 的 `75 4E` 改为 `EB 4E`，强制走普通路径。
+- **DInput 虚表**：只原地修改原始虚表的 `EnumDevices`（槽位 4）与 `GetDeviceState`（槽位 9），不复制虚表、不替换设备 vptr。
+- **EnumCache**：首次 `EnumDevices` 成功后按 `(dwDevType, dwFlags)` 缓存最多 4 键 × 16 设备；之后回放，失败或设备数溢出时回落真实枚举。
+- **Fast60**：`60fps=1` 时时间源全局 ×2 + DXGI Present 60Hz 限速 + 标题栏 Present/s；F10 实时切换；任一 Hook 失败则全有或全无。
 
 ## 文件
 

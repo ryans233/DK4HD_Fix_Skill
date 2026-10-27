@@ -39,7 +39,7 @@ DK4HD_Fix.ini # 首次启动自动生成；同名 INI（见 2.0）
 extern "C" __declspec(dllexport) void InitializeASI(void);
 ```
 
-`DllMain(DLL_PROCESS_ATTACH)` 只做 `DisableThreadLibraryCalls`，不要在 `DllMain` 里做重活。
+`DllMain(DLL_PROCESS_ATTACH)` 只做 `DisableThreadLibraryCalls`；`DLL_PROCESS_DETACH` 只做与 `InitializeASI` 配对的 `timeEndPeriod(1)`（见 2.2）。不要在 `DllMain` 里创建线程、加载 DLL、初始化 MinHook 或做其他重活。
 
 支持的 exe：
 
@@ -105,6 +105,8 @@ Log=0
 ; 实验性：Fast60（整体约 2× 时间轴）+ 标题栏实时 FPS；F10 可实时切换 Fast60/30Hz（不修改 INI）
 60fps=0
 ```
+
+`<ASI同名>` 指 ASI 文件基名；实现可以把注释写成实际基名（如 `DK4HD_Fix.ini` / `DK4HD_Fix.log`），但 INI/日志路径必须是同目录、同基名。默认键值不能变。
 
 **日志**
 
@@ -186,7 +188,8 @@ Log=0
 
 - 默认 `FramePacing=1`、`CpuIdle=1`：Hook 时间函数，返回 QPC 毫秒值，不调用原函数。
 - 每线程维护 `lastQpc`：同一线程两次调用间隔 < 1ms 时 `Sleep(1)`，然后重新读取 QPC。
-- `InitializeASI` 中调用 `timeBeginPeriod(1)`（仅在 `CpuIdle=1` 时需要）。
+- `InitializeASI` 中调用 `timeBeginPeriod(1)`（仅在 `CpuIdle=1` 时需要）；只在返回 `TIMERR_NOERROR` 时记录“周期已启用”。
+- 该 1ms 周期必须覆盖整个 Hook 生命周期：在 `DLL_PROCESS_DETACH` 用 `timeEndPeriod(1)` 配对释放（仅当上面记录过成功），同时覆盖运行中 `FreeLibrary` 卸载 ASI 的情况；`winmm` 是静态导入，DETACH 时仍可调用。
 - 返回 `uint32_t`（调用方使用低 32 位），QPC 毫秒值按 2^32 取模。
 
 **配置开关**
@@ -220,6 +223,7 @@ uint64_t HookTime(void* arg) {
 }
 ```
 
+- 返回值只需保证低 32 位正确；`uint32_t` 或 `uint64_t & 0xFFFFFFFF` 均可。
 - `ticksPerMs = qpcFreq / 1000`；若为 0 则设为 1。
 - **顺序要求**：QPC 频率、`ticksPerMs`、`timeBeginPeriod(1)` 必须在启用 Hook 前设置好，否则 Hook 可能除以 0。
 - 该 Hook 必须只替换时间函数；不要修改 `GetTickCount64` 本身。
@@ -335,6 +339,7 @@ uint64_t HookTime(void* arg) {
 | `0` | 原版 30Hz（默认） |
 | `1` | 实验性 Fast60 + 标题栏 FPS；F10 可实时切换 Fast60/30Hz，不修改 INI |
 
+- `60fps` 只定义 `0` / `1`；其他值不属于本规格与验收范围。
 - 默认 INI 注释必须写明“实验性”和“F10 可实时切换 Fast60/30Hz（不修改 INI）”。
 - 不提供独立的 `FpsTitle` 键；标题栏随 `60fps=1` 一起启用。
 
@@ -488,7 +493,8 @@ fast60 requested but not enabled (key=... peek=... present=... time=... enable=.
 约束：
 
 - blob 上限取 `>= sizeof(DIDEVICEINSTANCEW)`（建议 1104 字节）；复制长度 `min(inst->dwSize, 上限)`；`dwSize < 4` 视为无效丢弃（`DIDEVICEINSTANCEA` 只有 572 字节，不能按固定长度盲拷）。
-- 缓存容量建议 4 个键 × 每键 16 个设备；表满时**回落**到真实枚举，不覆盖已有键。
+- 缓存容量建议 4 个键 × 每键 16 个设备；表满时**回落**到真实枚举，不覆盖已有键。这里的“表满”指 4 个键用尽。
+- 只有首次枚举成功（`SUCCEEDED(hr)`）且单键设备数未超过 16 时才把条目标记为可回放；枚举失败或设备数溢出时回落到真实枚举，不要缓存半截结果。
 - 加一个重入标志：重入或表满时直接调用原函数，并保证所有分支都释放该标志。
 - 回调返回 `DIENUM_STOP` 时立即停止回放。
 - 首次调用仍会慢一次（约 440ms），发生在进入主菜单前，属可接受成本。
@@ -506,6 +512,8 @@ hooked IDirectInput8::EnumDevices at <ptr>
 dinput enum: captured <n> device(s) type=0x<dwDevType> flags=0x<dwFlags> in <ms> ms, cached
 dinput enum: replayed <n> device(s) type=0x<dwDevType> flags=0x<dwFlags>
 ```
+
+枚举失败或设备数溢出时，可另写一行 `dinput enum: capture failed ...`；成功路径必须包含上面的 `captured ... cached` 和 `replayed ...`。
 
 **验收**
 
@@ -567,7 +575,7 @@ dinput enum: replayed <n> device(s) type=0x<dwDevType> flags=0x<dwFlags>
 3. 读取 INI；不存在则创建默认文件；已存在则不覆盖；缺失键用默认值。
 4. 仅当 `Log=1` 时打开日志（`"w"` 截断）；`Log=0` 时不得创建/打开/写入。
 5. 写 `InitializeASI exe=<basename> base=<ptr> asi=<path>` 和 `config: ini=... log=... FramePacing=... CpuIdle=... ClickLatch=... ClickRelease=... SkipIntro=... Log=... 60fps=...`。
-6. `QueryPerformanceFrequency`；`ticksPerMs = freq / 1000`（至少 1）；仅 `CpuIdle=1` 时 `timeBeginPeriod(1)`；写 `qpcFreq=... ticksPerMs=...`。
+6. `QueryPerformanceFrequency`；`ticksPerMs = freq / 1000`（至少 1）；仅 `CpuIdle=1` 时调用 `timeBeginPeriod(1)`，返回 `TIMERR_NOERROR` 才记录“周期已启用”；写 `qpcFreq=... ticksPerMs=...`。
 7. 读取 `.text` 的 `VirtualAddress` / `Misc.VirtualSize`。
 8. 若 `SkipIntro=1`：按 2.5 定位并改写三处函数；写 `skip intro: ... patched at ...`（关闭时写 `skip intro: disabled`）。
 9. 若 `FramePacing=1 || CpuIdle=1`：按 2.1 定位时间函数；若 `ClickLatch=1 || ClickRelease=1`：定位鼠标轮询；失败按第 1 节 RVA 回退并校验；写 `time=<ptr> mouse=<ptr> (scan)`。
@@ -578,6 +586,7 @@ dinput enum: replayed <n> device(s) type=0x<dwDevType> flags=0x<dwFlags>
 
 - 两个时间开关都为 0、且 `ClickLatch=0` 时，不要初始化 MinHook。
 - `ClickRelease` 是纯内存字节补丁，不依赖 MinHook。
+- `DLL_PROCESS_DETACH`：若步骤 6 记录过成功，调用 `timeEndPeriod(1)` 配对并清除记录；不要在 detach 里做其他工作。该配对不写日志，需代码审查或 instrumented probe 验证。
 
 日志示例（`Log=1`，`SkipIntro=0`）：
 
@@ -653,7 +662,7 @@ g++ -shared -m64 -std=c++17 -O2 -DNDEBUG -Iinclude \
     -luser32 -lwinmm -ld3d11 -ldxgi -static-libgcc -static-libstdc++
 ```
 
-- 链接 `user32`、`winmm`（`timeBeginPeriod`）、`d3d11`、`dxgi`（Fast60 Present Hook / FPS 标题栏）。
+- 链接 `user32`、`winmm`（`timeBeginPeriod` / `timeEndPeriod`）、`d3d11`、`dxgi`（Fast60 Present Hook / FPS 标题栏）。
 - 产物必须是 x64 PE DLL；用 `objdump -f` 检查 `pei-x86-64`。
 
 ---
@@ -680,7 +689,7 @@ objdump -p version.dll | grep -E "GetFileVersionInfo(A|SizeA)"
 - 首次启动自动生成同名 `DK4HD_Fix.ini`（UTF-8 + 中文注释）；默认除 `SkipIntro`、`Log`、`60fps` 外全部启用。
 - `Log=0`（默认）时不生成/不写入 `DK4HD_Fix.log`；`Log=1` 时才生成同名日志。
 - 保持系统 `DINPUT8.dll` 不变，不要让代理层介入 DirectInput COM 接口。
-- 卸载：删除 `version.dll`、`DK4HD_Fix.asi`、`DK4HD_Fix.ini`、`DK4HD_Fix.log`（仅 `Log=1` 时存在）；游戏文件不需要恢复。
+- 卸载：删除 `version.dll`、`DK4HD_Fix.asi`、`DK4HD_Fix.ini`、`DK4HD_Fix.log`（仅 `Log=1` 时存在）；游戏文件不需要恢复。进程退出或运行中 `FreeLibrary` 卸载 ASI 时，`DllMain(DLL_PROCESS_DETACH)` 会配对 `timeEndPeriod(1)`；删除文件本身不会触发热卸载。
 - 不要同时放多个 ASI Loader；与其他占用 `version.dll` 的 Mod 冲突。
 
 ---
@@ -706,6 +715,7 @@ python tools\check_startup.py --game-dir "D:\Games\DK4HD"
 对 TC/KR/JP/SC 四个 exe 依次启动、等待 8s，逐项检查：进程仍存活、`InitializeASI exe=... base=...`、`config: ...`（键值与默认/当前 INI 一致）、`qpcFreq=... ticksPerMs=...`（`ticksPerMs >= 1`）、`skip intro: ...`、`time=... mouse=... (scan)`（或 `(rva)`）、`release fix: poll+0x42 patched at ...`、`mouse poll hook: 1`、`time hook: 0`、`hook PeekMessageA: 0`、`hooked mouse GetDeviceState dev=... vt=... real=...`。
 
 - 脚本先备份 INI，临时把 `Log` 设为 1；结束后恢复原 INI 和日志。
+- `timeBeginPeriod` / `timeEndPeriod` 的配对不在日志中；9.1 只检查 `qpcFreq=... ticksPerMs=...` 初始化。配对需代码审查或 instrumented probe（确认 `CpuIdle=1` 时 detach 执行 `timeEndPeriod(1)`，`CpuIdle=0` 时跳过）。
 - 每个 exe 输出 `[PASS]` / `[FAIL] : missing <项>`；
 - 任一失败返回退出码 1；
 - 全程不应出现错误框、崩溃或退出。
@@ -881,7 +891,8 @@ A/B（默认最多尝试 2 个 exe，出现慢基线即停）：同一 exe 用 `
 - ❌ 在时间 Hook 里对所有调用 `Sleep(1)` 而不做 1ms 阈值：会影响正常计时；必须每线程判断间隔。
 - ❌ 用 `DIPROP_BUFFERSIZE` / `GetDeviceData`：本设计不依赖缓冲；会引入额外状态问题。
 - ❌ 用 `SendInput` / 鼠标移动触发 UI：点击锁存只改 `GetDeviceState` 返回值。
-- ❌ 在 `DllMain` 里创建线程、加载 DLL、初始化 MinHook：放在 `InitializeASI` 中。
+- ❌ 在 `DllMain` 里创建线程、加载 DLL、初始化 MinHook：放在 `InitializeASI` 中；`DLL_PROCESS_DETACH` 仅允许与 `timeBeginPeriod` 配对的 `timeEndPeriod(1)`。
+- ❌ 只调用 `timeBeginPeriod(1)` 而不配对 `timeEndPeriod(1)`：会留下未释放的高精度定时器请求；只在 `timeBeginPeriod` 返回 `TIMERR_NOERROR` 时记录状态，并在 `DLL_PROCESS_DETACH` 配对释放。
 - ❌ 注入后不清 pending：会导致重复按下；`exchange(false)` 后无论是否过期都要清除。
 - ❌ 对非鼠标设备注入 `0x80`：会污染键盘/手柄状态；必须过滤 `self == g_mouseDevice`。
 - ❌ 只开 `ClickLatch` 而不开 `ClickRelease`：锁存只补“按下”，可能让左键卡在按下；默认必须两者都开。
