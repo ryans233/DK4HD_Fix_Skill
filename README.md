@@ -1,12 +1,12 @@
 # DK4HD Runtime Compatibility Skill
 
-一份面向 LLM 的独立实现规格（skill）：消除 DK4HD 的帧节奏抖动、单核满载、短点击丢失、“只按下、不弹起”和每约 2.6s 一次的 445ms 设备枚举卡顿，并提供可选的实验性 Fast60 + 标题栏 FPS，而不改游戏本体。
+一份面向 LLM 的独立实现规格（skill）：用可验证的行为规格描述 DK4HD 运行时兼容模块要做的事与验收标准；修复项见下表，模块不改游戏本体。
 
-**English:** A standalone behavioral specification/skill for an LLM to implement a DK4HD runtime compatibility module from scratch — fixing frame-pacing jitter, one-core CPU spin, dropped short clicks, lost button releases, the periodic 445ms device-enumeration stall, and an optional experimental Fast60 + FPS title without touching the game itself.
+**English:** A standalone behavioral specification/skill for an LLM to implement a DK4HD runtime compatibility module from scratch: what to hook, the constants involved, and how each item is accepted. The module never modifies the game itself.
 
 ## 这个 Skill 是什么
 
-先看装上之后玩家能感知到什么。原版 DK4HD 在多数机器上有五个毛病，这个模块只修这五个：
+先看装上之后玩家能感知到什么。下表是原版 DK4HD 在多数机器上的常见毛病与本模块的处理方式；规格只覆盖表中项目，不做额外扩展：
 
 | 你会遇到 | 原版 | 装上后 | 为什么 |
 |---|---|---|---|
@@ -19,7 +19,7 @@
 
 默认画面、存档、玩法都不变：没有新窗口、新菜单，游戏仍是约 30fps。`60fps=1` 是**实验性可选功能**，会让整个游戏时间轴约 2× 速；默认 `60fps=0`。
 
-`skills.md` 是写给 LLM 的实现规格，把上面四个修复拆成**可验证的行为规格**：Hook 哪个函数、用哪段字节签名定位、虚表改哪个槽位、常量是多少、初始化顺序、INI/日志规则、每项怎么验收。照着做完就产出一个 x64 ASI 插件。它不是设计综述也不是教程，而是“做到什么程度才算完成”的判据。
+`skills.md` 是写给 LLM 的实现规格，把表中项目拆成**可验证的行为规格**：Hook 哪个函数、用哪段字节签名定位、虚表改哪个槽位、常量是多少、初始化顺序、INI/日志规则、每项怎么验收。照着做完就产出一个 x64 ASI 插件。它不是设计综述也不是教程，而是“做到什么程度才算完成”的判据。
 
 文档只包含接口事实、常量、签名和行为规格，不包含游戏代码、资源或实现源码。
 
@@ -33,15 +33,15 @@
    - 游戏 `DK4HD_tc.exe` / `DK4HD_kr.exe` / `DK4HD_jp.exe` / `DK4HD_sc.exe`
    - MSYS2 MinGW-w64 + MinHook（需从源码构建）
    - Ultimate-ASI-Loader：直接用官方 x64 预编译 `version.dll`，不需要也不应该自己实现 ASI loader
-4. 让 LLM 按文档顺序实现（对应 `skills.md` §2.1–2.8）：
+4. 让 LLM 按文档顺序实现（对应 `skills.md` §2.0–2.7）：
+   - `2.0` 同名 INI + 可选日志（其余功能的开关与验收载体）；
    - `2.1` 多语言签名扫描（时间函数 + 鼠标轮询，含 RVA 回退与前置校验）；
    - `2.2` QPC 帧节奏 + 1ms 节流；
    - `2.3` 鼠标轮询 Hook + `GetDeviceState` 点击锁存；
    - `2.4` `poll+0x42` 抬起沿修复；
    - `2.5` `SkipIntro`（测试辅助，默认关闭）；
    - `2.6` 可选实验性 `60fps=1`：Fast60 + 标题栏 FPS + F10 切换 + 方向键修复；
-   - `2.7` 同名 INI + 可选日志；
-   - `2.8` 设备枚举缓存（`EnumCache`，默认开启）。
+   - `2.7` 设备枚举缓存（`EnumCache`，默认开启）。
 5. 构建产物 `.asi` 与预编译 loader 一起放到游戏根目录：
 
    ```text

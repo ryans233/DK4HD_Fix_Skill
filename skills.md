@@ -23,10 +23,10 @@
 ```text
 version.dll        # 部署依赖：Ultimate-ASI-Loader x64 预编译二进制，原样使用，不实现
 DK4HD_Fix.asi # 独立实现的 x64 DLL（名称可自定；下同）
-DK4HD_Fix.ini # 首次启动自动生成；同名 INI（见 2.7）
+DK4HD_Fix.ini # 首次启动自动生成；同名 INI（见 2.0）
 ```
 
-- 首次启动在同目录生成与 ASI 同基名的 `.ini`；`Log=0`（默认）不生成 `.log`，`Log=1` 才写同名日志（见 2.7）。
+- 首次启动在同目录生成与 ASI 同基名的 `.ini`；`Log=0`（默认）不生成 `.log`，`Log=1` 才写同名日志（见 2.0）。
 
 - `version.dll` **不是**实现目标。直接取 Ultimate-ASI-Loader 官方 release 的 x64 `version.dll` 复制到游戏根目录；不需要自己编译、重写或逆向 loader。
 - **不要**自行实现 ASI loader / `version.dll` 代理：本文档未提供导出转发、ASI 目录扫描、加载时序等规格，loader 因此不可按本文档验收，也不在独立实现范围内。
@@ -52,11 +52,81 @@ extern "C" __declspec(dllexport) void InitializeASI(void);
 
 > RVA 基于 ImageBase `0x140000000`；运行时地址 = exe 模块基址 + RVA。优先扫描签名，RVA 表仅作回退。表内值为函数入口，回退时仍必须通过第 2.1 节的前缀校验。时间函数两版 RVA 相同；鼠标轮询在 1.0.1/1.0.2 间后移 `0xB0`，回退时按 exe 名依次尝试两个版本，命中并通过校验的那个才使用；全部失败才安全退出（第 9.5 节）。
 
-> **建议实现顺序**：先做多语言签名扫描（2.1），确认四个 exe 都能定位；再接 QPC 时间 Hook 的帧节奏（2.2）；然后两个鼠标点击修复（2.3 锁存、2.4 抬起沿）；随后加入 `SkipIntro`（2.5，默认关）与实验性 Fast60（2.6）；再接同名 INI/日志（2.7）；最后做设备枚举缓存（2.8）。Fast60 必须默认关闭，且不要与“保持原时长”的补偿 Hook 混用。
+> **建议实现顺序**：先做同名 INI/日志（2.0），它是其余功能的开关与验收载体；再做多语言签名扫描（2.1），确认四个 exe 都能定位；接着 QPC 时间 Hook 的帧节奏（2.2）；然后两个鼠标点击修复（2.3 锁存、2.4 抬起沿）；随后加入 `SkipIntro`（2.5，默认关）与实验性 Fast60（2.6）；最后做设备枚举缓存（2.7）。Fast60 必须默认关闭，且不要与“保持原时长”的补偿 Hook 混用。
 
 ---
 
 ## 2. 必须实现的修复行为
+
+### 2.0 同名 INI 配置 + 可选日志
+
+**配置文件**
+
+- 从 ASI 自身模块路径推导：同目录、同基名、扩展名 `.ini`。例如 `DK4HD_Fix.asi` → `DK4HD_Fix.ini`。不要让 INI 文件名与 ASI 名脱钩。
+- 文件不存在时创建默认 INI；已存在时**不要覆盖**，只读取；缺失的键使用默认值。
+- 默认文件使用 UTF-8 BOM + CRLF，每个选项前有中文注释；键名保持 ASCII。
+- 读取使用 ANSI profile API（`GetPrivateProfileIntA`）即可；BOM/中文注释不影响 `[Fix]` 段和 ASCII 键。
+- 修改后重启游戏生效。
+
+`[Fix]` 段的键与默认值：
+
+| 键 | 默认 | 含义 |
+|---|---:|---|
+| `FramePacing` | 1 | QPC 毫秒时间源 |
+| `CpuIdle` | 1 | 时间函数 1ms 节流 |
+| `ClickLatch` | 1 | 短点击锁存 |
+| `ClickRelease` | 1 | 抬起沿修复 |
+| `EnumCache` | 1 | 设备枚举缓存：复用首次 `IDirectInput8::EnumDevices` 结果 |
+| `SkipIntro` | 0 | 测试用：跳过片头/标题，直接进主菜单 |
+| `Log` | 0 | 是否输出日志；0 = 不创建/不写入 |
+| `60fps` | 0 | 实验性 Fast60 + 标题栏 FPS；1 = 开启，F10 实时切换 Fast60/30Hz（不修改 INI） |
+
+默认 INI 内容（中文注释是规格的一部分）：
+
+```ini
+; <ASI同名>.ini -- 首次运行时自动生成。
+; 1 = 启用，0 = 禁用。默认：除 SkipIntro、Log 和 60fps 外全部启用。
+[Fix]
+; 用 QPC 毫秒时间源替换 GetTickCount64，稳定 33ms 帧节奏
+FramePacing=1
+; 时间函数 1ms 节流，消除帧限速忙等（单核占用从约 100% 降到约 2%）
+CpuIdle=1
+; 短点击锁存：捕获 WM_LBUTTONDOWN/DBLCLK，在下一帧 GetDeviceState 注入一次按下
+ClickLatch=1
+; 抬起沿修复：绕过鼠标轮询的空闲快速路径，避免“只按下、不弹起”
+ClickRelease=1
+; 设备枚举缓存：复用首次 IDirectInput8::EnumDevices 结果，消除每约 2.6 秒一次的
+; 445ms HID 全量枚举卡顿（代价：运行中插拔手柄不会被识别）
+EnumCache=1
+; 测试用：跳过片头动画和标题画面，直接进入主菜单（默认关闭）
+SkipIntro=0
+; 是否输出日志：0 = 不生成/不写入 <ASI同名>.log（默认），1 = 生成
+Log=0
+; 实验性：Fast60（整体约 2× 时间轴）+ 标题栏实时 FPS；F10 可实时切换 Fast60/30Hz（不修改 INI）
+60fps=0
+```
+
+**日志**
+
+- 日志路径：同目录、同基名、扩展名 `.log`。
+- `Log=0`：**不要调用 `fopen`/创建/写入**，不能留下新的空日志文件；旧日志不要求删除。
+- `Log=1`：以 `"w"` 截断打开并写入。
+- 日志至少包含：
+  - `InitializeASI exe=<basename> base=<ptr> asi=<path>`
+  - `config: ini=<path> log=<path> FramePacing=... CpuIdle=... ClickLatch=... ClickRelease=... EnumCache=... SkipIntro=... Log=... 60fps=...`（`60fps` 字段用于 Fast60 验收；顺序不限）
+  - 各 Hook/补丁的状态（找到/未找到、成功/失败）。
+- 不要在每个输入帧写日志；日志只用于启动/安装诊断。
+- 验收构建可以额外输出 `latch` / `inject` 行（见 9.4），但发布构建必须遵守 `Log` 开关。
+
+**验收**
+
+- `tools/test_config.py`（第 9.7 节）：
+  - 删除 INI/日志 → 启动 → INI 自动出现、键值匹配、无日志；
+  - `Log=1` → 日志出现且包含生效配置；
+  - `SkipIntro=1` → 日志出现三处 skip 补丁；
+  - `Log=0` → 不创建日志。
+
+---
 
 ### 2.1 多语言定位：签名扫描，RVA 回退
 
@@ -394,77 +464,7 @@ fast60 requested but not enabled (key=... peek=... present=... time=... enable=.
 - 事件分支、战斗确定性、30 分钟长跑、Alt+Tab/全屏/分辨率切换未纳入本规格验收。
 - 1.0.1 和 1.0.2 已验证功能；其他游戏更新若改变时间函数签名，必须重新扫描/补签名。
 
-### 2.7 同名 INI 配置 + 可选日志
-
-**配置文件**
-
-- 从 ASI 自身模块路径推导：同目录、同基名、扩展名 `.ini`。例如 `DK4HD_Fix.asi` → `DK4HD_Fix.ini`。不要让 INI 文件名与 ASI 名脱钩。
-- 文件不存在时创建默认 INI；已存在时**不要覆盖**，只读取；缺失的键使用默认值。
-- 默认文件使用 UTF-8 BOM + CRLF，每个选项前有中文注释；键名保持 ASCII。
-- 读取使用 ANSI profile API（`GetPrivateProfileIntA`）即可；BOM/中文注释不影响 `[Fix]` 段和 ASCII 键。
-- 修改后重启游戏生效。
-
-`[Fix]` 段的键与默认值：
-
-| 键 | 默认 | 含义 |
-|---|---:|---|
-| `FramePacing` | 1 | QPC 毫秒时间源 |
-| `CpuIdle` | 1 | 时间函数 1ms 节流 |
-| `ClickLatch` | 1 | 短点击锁存 |
-| `ClickRelease` | 1 | 抬起沿修复 |
-| `EnumCache` | 1 | 设备枚举缓存：复用首次 `IDirectInput8::EnumDevices` 结果 |
-| `SkipIntro` | 0 | 测试用：跳过片头/标题，直接进主菜单 |
-| `Log` | 0 | 是否输出日志；0 = 不创建/不写入 |
-| `60fps` | 0 | 实验性 Fast60 + 标题栏 FPS；1 = 开启，F10 实时切换 Fast60/30Hz（不修改 INI） |
-
-默认 INI 内容（中文注释是规格的一部分）：
-
-```ini
-; <ASI同名>.ini -- 首次运行时自动生成。
-; 1 = 启用，0 = 禁用。默认：除 SkipIntro、Log 和 60fps 外全部启用。
-[Fix]
-; 用 QPC 毫秒时间源替换 GetTickCount64，稳定 33ms 帧节奏
-FramePacing=1
-; 时间函数 1ms 节流，消除帧限速忙等（单核占用从约 100% 降到约 2%）
-CpuIdle=1
-; 短点击锁存：捕获 WM_LBUTTONDOWN/DBLCLK，在下一帧 GetDeviceState 注入一次按下
-ClickLatch=1
-; 抬起沿修复：绕过鼠标轮询的空闲快速路径，避免“只按下、不弹起”
-ClickRelease=1
-; 设备枚举缓存：复用首次 IDirectInput8::EnumDevices 结果，消除每约 2.6 秒一次的
-; 445ms HID 全量枚举卡顿（代价：运行中插拔手柄不会被识别）
-EnumCache=1
-; 测试用：跳过片头动画和标题画面，直接进入主菜单（默认关闭）
-SkipIntro=0
-; 是否输出日志：0 = 不生成/不写入 <ASI同名>.log（默认），1 = 生成
-Log=0
-; 实验性：Fast60（整体约 2× 时间轴）+ 标题栏实时 FPS；F10 可实时切换 Fast60/30Hz（不修改 INI）
-60fps=0
-```
-
-**日志**
-
-- 日志路径：同目录、同基名、扩展名 `.log`。
-- `Log=0`：**不要调用 `fopen`/创建/写入**，不能留下新的空日志文件；旧日志不要求删除。
-- `Log=1`：以 `"w"` 截断打开并写入。
-- 日志至少包含：
-  - `InitializeASI exe=<basename> base=<ptr> asi=<path>`
-  - `config: ini=<path> log=<path> FramePacing=... CpuIdle=... ClickLatch=... ClickRelease=... EnumCache=... SkipIntro=... Log=... 60fps=...`（`60fps` 字段用于 Fast60 验收；顺序不限）
-  - 各 Hook/补丁的状态（找到/未找到、成功/失败）。
-- 不要在每个输入帧写日志；日志只用于启动/安装诊断。
-- 验收构建可以额外输出 `latch` / `inject` 行（见 9.4），但发布构建必须遵守 `Log` 开关。
-
-**验收**
-
-- `tools/test_config.py`（第 9.7 节）：
-  - 删除 INI/日志 → 启动 → INI 自动出现、键值匹配、无日志；
-  - `Log=1` → 日志出现且包含生效配置；
-  - `SkipIntro=1` → 日志出现三处 skip 补丁；
-  - `Log=0` → 不创建日志。
-
----
-
-### 2.8 设备枚举缓存（`EnumCache`）
+### 2.7 设备枚举缓存（`EnumCache`）
 
 **现象与根因**
 
@@ -874,7 +874,7 @@ A/B（默认最多尝试 2 个 exe，出现慢基线即停）：同一 exe 用 `
 
 ## 10. 常见错误（不要这样做）
 
-- ❌ 为了点击锁存去包装/替换 `IDirectInput8` 或它的 `CreateDevice`：会破坏 DInput 初始化。`EnumCache`（2.8）只 hook `DirectInput8Create` 取指针，并**原地**改虚表槽位 4（`EnumDevices`），不改 `CreateDevice`、不复制虚表。
+- ❌ 为了点击锁存去包装/替换 `IDirectInput8` 或它的 `CreateDevice`：会破坏 DInput 初始化。`EnumCache`（2.7）只 hook `DirectInput8Create` 取指针，并**原地**改虚表槽位 4（`EnumDevices`），不改 `CreateDevice`、不复制虚表。
 - ❌ 复制 DInput 虚表并替换设备 vptr：`Acquire`/`SetCooperativeLevel` 可能返回 `E_INVALIDARG`；失焦后鼠标无法恢复。**只原地改 `GetDeviceState` 槽位。**
 - ❌ 用 18 字节 RTC 前缀搜索时间函数：会命中 2000+ 次；必须用 `div 100000000h` 唯一签名。
 - ❌ 只硬编码 TC RVA：KR/JP/SC 会失效；必须扫描 + 回退表 + 校验。
