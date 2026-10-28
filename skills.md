@@ -574,25 +574,28 @@ dinput enum: replayed <n> device(s) type=0x<dwDevType> flags=0x<dwFlags>
 2. 取 ASI 自身模块（`GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, &InitializeASI, ...)`），由 ASI 路径推导 INI / 日志路径（同目录、同基名）。
 3. 读取 INI；不存在则创建默认文件；已存在则不覆盖；缺失键用默认值。
 4. 仅当 `Log=1` 时打开日志（`"w"` 截断）；`Log=0` 时不得创建/打开/写入。
-5. 写 `InitializeASI exe=<basename> base=<ptr> asi=<path>` 和 `config: ini=... log=... FramePacing=... CpuIdle=... ClickLatch=... ClickRelease=... SkipIntro=... Log=... 60fps=...`。
+5. 写 `InitializeASI exe=<basename> base=<ptr> asi=<path>` 和 `config: ini=... log=... FramePacing=... CpuIdle=... ClickLatch=... ClickRelease=... EnumCache=... SkipIntro=... Log=... 60fps=...`。
 6. `QueryPerformanceFrequency`；`ticksPerMs = freq / 1000`（至少 1）；仅 `CpuIdle=1` 时调用 `timeBeginPeriod(1)`，返回 `TIMERR_NOERROR` 才记录“周期已启用”；写 `qpcFreq=... ticksPerMs=...`。
 7. 读取 `.text` 的 `VirtualAddress` / `Misc.VirtualSize`。
 8. 若 `SkipIntro=1`：按 2.5 定位并改写三处函数；写 `skip intro: ... patched at ...`（关闭时写 `skip intro: disabled`）。
 9. 若 `FramePacing=1 || CpuIdle=1`：按 2.1 定位时间函数；若 `ClickLatch=1 || ClickRelease=1`：定位鼠标轮询；失败按第 1 节 RVA 回退并校验；写 `time=<ptr> mouse=<ptr> (scan)`。
 10. 若 `ClickRelease=1`：校验并改写鼠标轮询 `+0x42`（`75 4E` → `EB 4E`）；写 `release fix: poll+0x42 patched at <ptr>`（关闭时写 `release fix: disabled`）。
 11. 若 `ClickLatch=1`：安装鼠标轮询 inline Hook；写 `mouse poll hook: 1`（失败写 0，并停止后续输入 Hook）。
-12. 若时间 Hook 或 `ClickLatch` 需要 MinHook：`MH_Initialize`；创建时间 Hook（若需要）；创建 `PeekMessageA` Hook（若 `ClickLatch=1`）；`MH_EnableHook(MH_ALL_HOOKS)`；分别写 `time hook: <status> (FramePacing=... CpuIdle=...)`、`hook PeekMessageA: <status>`、`MH_EnableHook: <status>`。
-13. 首次鼠标轮询时安装 DInput 虚表 Hook；写 `hooked mouse GetDeviceState dev=<ptr> vt=<ptr> real=<ptr>`。
+12. 若时间 Hook、`ClickLatch` 或 `EnumCache` 需要 MinHook：`MH_Initialize`；创建时间 Hook（若需要）；创建 `PeekMessageA` Hook（若 `ClickLatch=1`）；创建 `DirectInput8Create` Hook（若 `EnumCache=1`）；`MH_EnableHook(MH_ALL_HOOKS)`；分别写 `time hook: <status> (FramePacing=... CpuIdle=...)`、`hook PeekMessageA: <status>`、`dinput enum hook: <status>`、`MH_EnableHook: <status>`。
+13. 游戏首次调用 `DirectInput8Create` 成功后，用返回的 `IDirectInput8*` **原地**改虚表槽位 4（`EnumDevices`），保存原函数指针；写 `hooked IDirectInput8::EnumDevices at <ptr>`。
+14. 首次鼠标轮询时安装 DInput 虚表 Hook；写 `hooked mouse GetDeviceState dev=<ptr> vt=<ptr> real=<ptr>`。
 
-- 两个时间开关都为 0、且 `ClickLatch=0` 时，不要初始化 MinHook。
+- 两个时间开关都为 0、`ClickLatch=0` 且 `EnumCache=0` 时，不要初始化 MinHook。
 - `ClickRelease` 是纯内存字节补丁，不依赖 MinHook。
+- `DirectInput8Create` 地址用 `LoadLibraryA("dinput8.dll")` + `GetProcAddress` 取得（或链接 `dinput8` 导入库）；取不到地址时写日志并跳过 `EnumCache`，不得影响其他修复。
+- `dinput enum: captured ... cached` / `dinput enum: replayed ...` 在游戏首次枚举设备后出现（约进入主菜单前，见 2.7），不在启动阶段写入；首轮真实枚举约 440ms 属可接受成本。
 - `DLL_PROCESS_DETACH`：若步骤 6 记录过成功，调用 `timeEndPeriod(1)` 配对并清除记录；不要在 detach 里做其他工作。该配对不写日志，需代码审查或 instrumented probe 验证。
 
 日志示例（`Log=1`，`SkipIntro=0`）：
 
 ```text
 InitializeASI exe=DK4HD_tc.exe base=00007ff74cb00000 asi=...
-config: ini=...\DK4HD_Fix.ini log=...\DK4HD_Fix.log FramePacing=1 CpuIdle=1 ClickLatch=1 ClickRelease=1 SkipIntro=0 Log=1 60fps=0
+config: ini=...\DK4HD_Fix.ini log=...\DK4HD_Fix.log FramePacing=1 CpuIdle=1 ClickLatch=1 ClickRelease=1 EnumCache=1 SkipIntro=0 Log=1 60fps=0
 qpcFreq=10000000 ticksPerMs=10000
 skip intro: disabled
 time=00007ff74cbd6630 mouse=00007ff74cdb5b10 (scan)
@@ -601,7 +604,11 @@ mouse poll hook installed at 00007ff74cdb5b10
 mouse poll hook: 1
 time hook: 0 (FramePacing=1 CpuIdle=1)
 hook PeekMessageA: 0
+dinput enum hook: 0
 MH_EnableHook: 0
+hooked IDirectInput8::EnumDevices at 00007ff7...
+dinput enum: captured 0 device(s) type=0x4 flags=0x1 in 448 ms, cached
+dinput enum: replayed 0 device(s) type=0x4 flags=0x1
 hooked mouse GetDeviceState dev=... vt=... real=...
 ```
 
@@ -712,8 +719,9 @@ python tools\check_startup.py --game-dir "D:\Games\DK4HD"
 python tools\check_startup.py --game-dir "D:\Games\DK4HD"
 ```
 
-对 TC/KR/JP/SC 四个 exe 依次启动、等待 8s，逐项检查：进程仍存活、`InitializeASI exe=... base=...`、`config: ...`（键值与默认/当前 INI 一致）、`qpcFreq=... ticksPerMs=...`（`ticksPerMs >= 1`）、`skip intro: ...`、`time=... mouse=... (scan)`（或 `(rva)`）、`release fix: poll+0x42 patched at ...`、`mouse poll hook: 1`、`time hook: 0`、`hook PeekMessageA: 0`、`hooked mouse GetDeviceState dev=... vt=... real=...`。
+对 TC/KR/JP/SC 四个 exe 依次启动、等待 8s，逐项检查：进程仍存活、`InitializeASI exe=... base=...`、`config: ...`（键值与默认/当前 INI 一致）、`qpcFreq=... ticksPerMs=...`（`ticksPerMs >= 1`）、`skip intro: ...`、`time=... mouse=... (scan)`（或 `(rva)`）、`release fix: poll+0x42 patched at ...`、`mouse poll hook: 1`、`time hook: 0`、`hook PeekMessageA: 0`、`dinput enum hook: 0`、`hooked mouse GetDeviceState dev=... vt=... real=...`。
 
+- `dinput enum: captured ... cached` / `replayed ...` 与设备枚举缓存的效果门禁由 9.10 检查，9.1 只看 Hook 是否安装成功。
 - 脚本先备份 INI，临时把 `Log` 设为 1；结束后恢复原 INI 和日志。
 - `timeBeginPeriod` / `timeEndPeriod` 的配对不在日志中；9.1 只检查 `qpcFreq=... ticksPerMs=...` 初始化。配对需代码审查或 instrumented probe（确认 `CpuIdle=1` 时 detach 执行 `timeEndPeriod(1)`，`CpuIdle=0` 时跳过）。
 - 每个 exe 输出 `[PASS]` / `[FAIL] : missing <项>`；
@@ -802,7 +810,7 @@ python tools\test_config.py --game-dir "D:\Games\DK4HD"
 
 脚本分阶段执行并**备份/恢复原 INI 与日志**：
 
-1. 删除 INI/日志 → 启动 → 断言 INI 自动生成；`[Fix]` 七个键存在且默认值为 `1/1/1/1/0/0/0`；日志不存在。
+1. 删除 INI/日志 → 启动 → 断言 INI 自动生成；`[Fix]` 八个键存在且默认值为 `1/1/1/1/1/0/0/0`；日志不存在。
 2. 写入 `Log=1`、`SkipIntro=1`（`60fps=0`，其余 1）→ 启动 3s → 断言日志存在、`config:` 含 `SkipIntro=1`、`skip intro:` 至少三行 patched；窗口出现且进程存活。
 3. 写入 `Log=0`、删除日志 → 启动 2s → 断言日志不存在。
 4. 结束测试进程，恢复原 INI/日志。

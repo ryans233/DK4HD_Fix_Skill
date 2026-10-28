@@ -65,7 +65,8 @@ def main():
                     f"{key}={value}" in config_line
                     for key, value in (
                         ("FramePacing", 1), ("CpuIdle", 1), ("ClickLatch", 1),
-                        ("ClickRelease", 1), ("SkipIntro", 0), ("Log", 1), ("60fps", 0),
+                        ("ClickRelease", 1), ("EnumCache", 1), ("SkipIntro", 0),
+                        ("Log", 1), ("60fps", 0),
                     )),
                 "qpc init": bool(re.search(r"qpcFreq=\d+ ticksPerMs=[1-9]\d*", log)),
                 "skip intro state": bool(re.search(r"(?m)^skip intro: disabled\r?$", log)),
@@ -76,6 +77,7 @@ def main():
                 "mouse poll hooked": bool(re.search(r"(?m)^mouse poll hook: 1\r?$", log)),
                 "time hook": bool(re.search(r"(?m)^time hook: 0\b", log)),
                 "PeekMessageA hook": bool(re.search(r"(?m)^hook PeekMessageA: 0\r?$", log)),
+                "dinput enum hook": bool(re.search(r"(?m)^dinput enum hook: 0\r?$", log)),
                 "GetDeviceState hooked": bool(re.search(
                     r"(?m)^hooked mouse GetDeviceState dev=0x?[0-9a-fA-F]+ "
                     r"vt=0x?[0-9a-fA-F]+ real=0x?[0-9a-fA-F]+", log)),
