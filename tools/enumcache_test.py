@@ -54,7 +54,7 @@ os.makedirs(OUTDIR, exist_ok=True)
 PRESENTMON = os.environ.get("PRESENTMON", os.path.join(HERE, "PresentMon.exe"))
 ALL_EXES = ["DK4HD_tc.exe", "DK4HD_kr.exe", "DK4HD_jp.exe", "DK4HD_sc.exe"]
 
-STALL_MS = 100.0     # a healthy 30Hz frame is ~33-36ms
+STALL_MS = 100.0     # a healthy 30Hz frame is ~33ms (limiter >=33 + spin)
 FG_MIN = 0.9         # foreground ratio required during the sample window
 
 RE_CAPTURE = re.compile(

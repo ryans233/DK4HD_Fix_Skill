@@ -6,6 +6,8 @@
 Launches the game, lets it settle, records a 15 s PresentMon capture with
 --v1_metrics, and checks msBetweenPresents percentiles. PresentMon 2.6.0 is
 downloaded from the official Intel release when --presentmon is not supplied.
+
+Run this with 60fps=0 (30Hz).  Fast60 is covered by tools/fast60_test.py (9.9).
 """
 
 import argparse
@@ -34,9 +36,9 @@ def parse_args():
     p.add_argument("--seconds", type=int, default=15)
     p.add_argument("--presentmon", default="")
     p.add_argument("--csv", default="")
-    p.add_argument("--p50-min", type=float, default=32.0)
-    p.add_argument("--p50-max", type=float, default=34.5)
-    p.add_argument("--p95-max", type=float, default=40.0)
+    p.add_argument("--p50-min", type=float, default=32.5)
+    p.add_argument("--p50-max", type=float, default=33.5)
+    p.add_argument("--p95-max", type=float, default=34.0)
     return p.parse_args()
 
 
@@ -145,7 +147,7 @@ def main():
     if slow_band > 0.01:
         print("[FAIL] more than 1% of frames land in the 45-49.5 ms quantization band")
         ok = False
-    if not (28.0 <= fps <= 32.0):
+    if not (29.5 <= fps <= 31.0):
         print(f"[FAIL] p50 frame rate is {fps:.1f} fps, expected ~30")
         ok = False
 

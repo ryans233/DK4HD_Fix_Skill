@@ -76,6 +76,10 @@ def main():
                     r"(?m)^release fix: poll\+0x42 patched at 0x?[0-9a-fA-F]+", log)),
                 "mouse poll hooked": bool(re.search(r"(?m)^mouse poll hook: 1\r?$", log)),
                 "time hook": bool(re.search(r"(?m)^time hook: 0\b", log)),
+                "frame limiter patch": bool(re.search(
+                    r"(?m)^frame limiter: >33 -> >=33 at 0x?[0-9a-fA-F]+", log)),
+                "frame limiter hook": bool(re.search(
+                    r"(?m)^frame limiter elapsed hook: 0\r?$", log)),
                 "PeekMessageA hook": bool(re.search(r"(?m)^hook PeekMessageA: 0\r?$", log)),
                 "dinput enum hook": bool(re.search(r"(?m)^dinput enum hook: 0\r?$", log)),
                 "GetDeviceState hooked": bool(re.search(

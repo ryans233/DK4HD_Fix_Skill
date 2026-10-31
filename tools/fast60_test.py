@@ -10,9 +10,9 @@ Checks, for each language build:
 
 The temporary INI/log are backed up and restored.  The performance gate is
 applied to the first selected exe (default TC); other languages are functional
-checks only.  Gate: p50 <= 18.0ms, p95 <= 20.0ms, fps >= 55.  This explicitly
-catches the regression where the Fast60 time hook calls Sleep(1) on every
-invocation instead of once per 1ms window.
+checks only.  Gate: p50 <= 16.9ms, p95 <= 17.5ms, fps >= 59.5.  This catches
+both the old strict `>33` limiter (17.0ms / 58.8fps) and the per-call Sleep(1)
+regression (~19.2ms).
 
 Usage (from repo root):
   python tools/fast60_test.py --game-dir "E:\Games\DK4HD"
@@ -51,11 +51,12 @@ VK = ctypes.windll.user32
 KERNEL32 = ctypes.windll.kernel32
 
 # Performance gate for the Fast60 + CpuIdle=1 main-menu steady state.
-# A correct 1ms-window throttle measures ~17.0ms p50 / ~18.5-19.0ms p95;
-# per-call Sleep(1) in the time hook measures ~19.2ms p50 / ~20.6ms p95.
-FAST60_P50_MAX_MS = 18.0
-FAST60_P95_MAX_MS = 20.0
-FAST60_MIN_FPS = 55.0
+# With the `>33` -> `>=33` limiter fix and the deadline-aware spin, p50/p95 are
+# both ~16.667ms and PresentMon reports ~59.9-60.0 fps.  The old strict `>33`
+# limiter measures 17.0ms / 58.8 fps; per-call Sleep(1) measures ~19.2ms.
+FAST60_P50_MAX_MS = 16.9
+FAST60_P95_MAX_MS = 17.5
+FAST60_MIN_FPS = 59.5
 
 
 def write_fast60_ini(path: str) -> None:
@@ -169,7 +170,7 @@ def read_log(path: str) -> str:
 
 
 def parse_title_mode(text: str) -> tuple[int | None, str | None]:
-    # Example: "... [58 FPS | Fast60 (2x speed)]"
+    # Example: "... [60 FPS | Fast60 (2x speed)]"
     try:
         body = text.rsplit("[", 1)[1].split("]", 1)[0]
         fps_part, mode = body.split("|", 1)
@@ -241,6 +242,8 @@ def test_exe(exe: str, do_presentmon: bool, timeout: float, warmup: float,
         checks["present_hook"] = "dxgi present hook: 0" in log
         checks["key_guard"] = "fast60 key guard: 0" in log
         checks["peek_hook"] = "hook PeekMessageA: 0" in log
+        checks["frame_limiter_patched"] = "frame limiter: >33 -> >=33" in log
+        checks["frame_limiter_hook"] = "frame limiter elapsed hook: 0" in log
         checks["title_fast60"] = mode0 is not None and "Fast60" in mode0
         checks["title_fps"] = fps0 is not None
         checks["focus_start"] = foreground_is(hwnd)
@@ -262,9 +265,9 @@ def test_exe(exe: str, do_presentmon: bool, timeout: float, warmup: float,
                 if "error" in pm:
                     checks["presentmon_sample"] = False
                 else:
-                    checks["fast60_p50_<=18ms"] = pm["p50_ms"] <= FAST60_P50_MAX_MS
-                    checks["fast60_p95_<=20ms"] = pm["p95_ms"] <= FAST60_P95_MAX_MS
-                    checks["fast60_fps_>=55"] = pm["fps"] >= FAST60_MIN_FPS
+                    checks["fast60_p50_<=16.9ms"] = pm["p50_ms"] <= FAST60_P50_MAX_MS
+                    checks["fast60_p95_<=17.5ms"] = pm["p95_ms"] <= FAST60_P95_MAX_MS
+                    checks["fast60_fps_>=59.5"] = pm["fps"] >= FAST60_MIN_FPS
             else:
                 result["presentmon_recorded_only"] = True
 
