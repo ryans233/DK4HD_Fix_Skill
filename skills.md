@@ -193,6 +193,7 @@ Log=0
 - 逐字节 `memcmp`；只接受同时满足签名与前置校验的命中。
 - 扫描失败时按 exe 文件名回退到第 1 节 RVA 表，并再次校验签名；仍失败则写日志并**不要**安装 Hook 或修改内存。帧限速器没有 RVA 回退：签名失败时只写日志，Fast60 回退到约 58.8 FPS。
 - 扫描/校验失败应安全退出，不崩溃、不修改错误地址。
+- 时间函数定位失败（签名与 RVA 回退均未命中）时不扫描、不 patch 帧限速器，并写 `frame limiter: time function not found; skipped`；鼠标、EnumCache、SkipIntro 修复不受影响。
 
 ### 2.2 帧节奏：QPC 时间源 + 1ms 节流
 
@@ -212,10 +213,10 @@ Log=0
    - 当当前时间距 `last + 33` 不足 **3 个游戏毫秒（30Hz）/ 4 个游戏毫秒（Fast60）** 时，停止 `Sleep(1)`，改为自旋；其余时间继续 `Sleep(1)`。这样 limiter 在 33ms 截止点精确退出，而不是被 `Sleep(1)` 拖过 33ms。
    - thunk 调用时刻超过 1ms 未刷新时视为已离开 limiter 等待循环，不再按该 deadline 自旋；非 limiter 时间调用本身不参与 1ms 节流（见下一条）。
    - **不要把非 limiter 时间调用纳入 1ms 节流**：它们可能位于标题/消息泵或 present 路径；`Sleep(1)` 在部分系统实测约 2ms，会把 present 推过 33ms 截止。30Hz 的主菜单 CPU 目标由 limiter 节流达成；9.2/9.3 明确在主菜单验收。
-   - **thunk 不可用时必须回退到全局 1ms 节流**：limiter 签名扫描失败、thunk 未找到或 thunk Hook 创建失败时，`CpuIdle=1` 不能退化为 100% 忙等；此时对所有时间调用按 1ms 窗口节流（本仓库 `src/DK4HD_Fix.cpp` 的 `g_scopedThrottle=false` 路径）。
+   - **thunk 不可用时必须回退到全局 1ms 节流**：limiter 签名扫描失败、thunk 未找到或 thunk Hook 创建失败时，`CpuIdle=1` 不能退化为 100% 忙等；此时对所有时间调用按 1ms 窗口节流（`g_scopedThrottle=false` 路径）。
 4. `InitializeASI` 中调用 `timeBeginPeriod(1)`（仅在 `CpuIdle=1` 时需要）；只在返回 `TIMERR_NOERROR` 时记录“周期已启用”。
 5. 该 1ms 周期必须覆盖整个 Hook 生命周期：在 `DLL_PROCESS_DETACH` 用 `timeEndPeriod(1)` 配对释放（仅当上面记录过成功），同时覆盖运行中 `FreeLibrary` 卸载 ASI 的情况；`winmm` 是静态导入，DETACH 时仍可调用。
-6. 返回 `uint32_t`（调用方使用低 32 位），QPC 毫秒值按 2^32 取模。
+6. 返回低 32 位（`uint32_t`，或 `uint64_t` 再按 2^32 取模）；调用方只使用低 32 位。
 
 **配置开关**
 
@@ -477,11 +478,12 @@ const int32_t remain = (int32_t)(lastLimiterMs + 33u - (uint32_t)gameNow);
 const bool nearDeadline =
     lastLimiterMs && (now.QuadPart - lastLimiterQpc) < ticksPerMs &&
     remain <= 4 && remain >= -4;
-const bool limiterCall = inLimiterCall;
+// thunk Hook 可用时只节流 limiter 调用；不可用时全局回退。
+const bool inScope = !scopedThrottle || inLimiterCall;
 
 if (!fast) {
     // 2.2 的 30Hz 分支（含 3ms 自旋）
-} else if (limiterCall && cpuIdle && !nearDeadline &&
+} else if (inScope && cpuIdle && !nearDeadline &&
            (lastCalib.QuadPart == 0 ||
             (now.QuadPart - lastCalib.QuadPart) >= ticksPerMs)) {
     Sleep(1);
@@ -711,16 +713,23 @@ BOOL capture_cb(const void* inst, void* ref) {
 HRESULT HookEnumDevices(self, type, cb, ref, flags) {
     if (!cb || reentrant) return real(self, type, cb, ref, flags);
     if (Entry* e = find(type, flags)) {
-        for (int i = 0; i < e->count; ++i)
+        int replayed = 0;
+        reentrant = true;                 // 回放期间同样防重入
+        for (int i = 0; i < e->count; ++i) {
+            ++replayed;
             if (cb(e->blobs[i], ref) == DIENUM_STOP) break;
-        log("dinput enum: replayed ...");
+        }
+        reentrant = false;
+        log("dinput enum: replayed %d device(s) ...", replayed);
         return DI_OK;
     }
     Entry* e = begin(type, flags);
     if (!e) return real(self, type, cb, ref, flags);
 
     Ctx ctx = { cb, ref, e, false };
+    reentrant = true;                     // capture 期间同样防重入
     HRESULT hr = real(self, type, capture_cb, &ctx, flags);
+    reentrant = false;
     if (SUCCEEDED(hr) && !ctx.stopped && commit(e)) {
         log("dinput enum: captured %d device(s) ... cached", e->count);
     } else {
@@ -733,6 +742,8 @@ HRESULT HookEnumDevices(self, type, cb, ref, flags) {
 
 - `used` 只在 `commit()` 成功时递增；失败/中止的 pending 槽不会进入 `find()`，下一次调用可原位重试。
 - 用户回调返回 `DIENUM_STOP` 表示这次枚举不完整（`stopped`），不得缓存；下一次调用重新枚举。
+- 回放分支也必须置重入标志：回放回调若再次调用 `EnumDevices`，必须走原函数而不是递归回放。
+- capture 与 replay 期间都必须置位重入标志；所有分支退出前清除。
 - 重入/表满时直接调用原函数；所有分支都要清重入标志。
 - 首次调用仍会慢一次（约 440ms），发生在进入主菜单前，属可接受成本。
 
@@ -818,7 +829,7 @@ dinput enum: replayed <n> device(s) type=0x<dwDevType> flags=0x<dwFlags>
 7. 读取 `.text` 的 `VirtualAddress` / `Misc.VirtualSize`。
 8. 若 `SkipIntro=1`：按 2.5 定位并改写三处函数；写 `skip intro: ... patched at ...`（关闭时写 `skip intro: disabled`）。
 9. 若 `FramePacing=1 || CpuIdle=1 || 60fps=1`：按 2.1 定位时间函数；若 `ClickLatch=1 || ClickRelease=1`：定位鼠标轮询；失败按第 1 节 RVA 回退并校验；写 `time=<ptr> mouse=<ptr> (scan)`。
-9a. 只要时间 Hook 需要安装（`FramePacing=1 || CpuIdle=1 || 60fps=1`）：按 2.1 节扫描 limiter 签名、解析签名前 `E8 rel32` 得到 elapsed thunk；仅在 `FramePacing=1 || 60fps=1` 时 patch `+3` 并写 `frame limiter: >33 -> >=33 at <ptr> (thunk=<ptr>)`。`FramePacing=0 && 60fps=0` 时只定位 thunk 并写 `frame limiter: located at <ptr> (thunk=<ptr>), patch disabled`，供 CpuIdle 节流。失败写 2.6 的对应日志并继续（Fast60 上限约 58.8 FPS；CpuIdle 回退全局节流）。
+9a. 只要时间 Hook 需要安装（`FramePacing=1 || CpuIdle=1 || 60fps=1`）：按 2.1 节扫描 limiter 签名、解析签名前 `E8 rel32` 得到 elapsed thunk；时间函数定位失败时整步跳过（见 2.1）。仅在 `FramePacing=1 || 60fps=1` 时 patch `+3` 并写 `frame limiter: >33 -> >=33 at <ptr> (thunk=<ptr>)`。`FramePacing=0 && 60fps=0` 时只定位 thunk 并写 `frame limiter: located at <ptr> (thunk=<ptr>), patch disabled`，供 CpuIdle 节流。失败写 2.6 的对应日志并继续（Fast60 上限约 58.8 FPS；CpuIdle 回退全局节流）。
 10. 若 `ClickRelease=1`：校验并改写鼠标轮询 `+0x42`（`75 4E` → `EB 4E`）；写 `release fix: poll+0x42 patched at <ptr>`（关闭时写 `release fix: disabled`）。
 11. 若 `ClickLatch=1`：安装鼠标轮询 inline Hook；写 `mouse poll hook: 1`（失败写 0，并停止后续输入 Hook）。
 12. 若时间 Hook、`ClickLatch` 或 `EnumCache` 需要 MinHook：`MH_Initialize`；创建时间 Hook（若需要）；创建 elapsed thunk Hook（若步骤 9a 成功）；创建 `PeekMessageA` Hook（若 `ClickLatch=1`）；创建 `DirectInput8Create` Hook（若 `EnumCache=1`）；`MH_EnableHook(MH_ALL_HOOKS)`；分别写 `time hook: <status> (FramePacing=... CpuIdle=...)`、`frame limiter elapsed hook: <status>`、`hook PeekMessageA: <status>`、`dinput enum hook: <status>`、`MH_EnableHook: <status>`。
@@ -839,21 +850,27 @@ bool needPatch = qpcOk && (framePacing || fast60Requested);
 
 if (needTime) {
     timeAddr = findTimeFunction();          // 2.1 签名 + RVA 回退
-    limiterHit = findUnique(limiterSig);    // 2.1，7 字节唯一签名
+    limiterHit = 0;
     elapsedThunk = 0;
-    if (limiterHit) {
-        elapsedThunk = decodeE8Target(limiterHit - 5);  // 必须在 .text
-        if (needPatch) {
-            if (patchByte(limiterHit + 3, 0x72))
-                log("frame limiter: >33 -> >=33 at ... (thunk=...)");
-            else
-                log("frame limiter: patch failed ..."); // 保留 hit/thunk
-        } else {
-            log("frame limiter: located at ... (thunk=...), patch disabled");
-        }
+    if (!timeAddr) {
+        // 2.1：定位失败不得修改内存；limiter 也不扫描。
+        log("frame limiter: time function not found; skipped");
     } else {
-        log(needPatch ? "frame limiter: signature not found; Fast60 stays at ~58.8 FPS"
-                      : "frame limiter: signature not found; CpuIdle uses the global throttle");
+        limiterHit = findUnique(limiterSig);    // 2.1，7 字节唯一签名
+        if (limiterHit) {
+            elapsedThunk = decodeE8Target(limiterHit - 5);  // 必须在 .text
+            if (needPatch) {
+                if (patchByte(limiterHit + 3, 0x72))
+                    log("frame limiter: >33 -> >=33 at ... (thunk=...)");
+                else
+                    log("frame limiter: patch failed ..."); // 保留 hit/thunk
+            } else {
+                log("frame limiter: located at ... (thunk=...), patch disabled");
+            }
+        } else {
+            log(needPatch ? "frame limiter: signature not found; Fast60 stays at ~58.8 FPS"
+                          : "frame limiter: signature not found; CpuIdle uses the global throttle");
+        }
     }
 }
 
@@ -951,15 +968,11 @@ hooked mouse GetDeviceState dev=... vt=... real=...
 
 要求：Windows x64、MSYS2 MinGW-w64、MinHook 源码；验收脚本另需 Python 3.12+（见第 9 节）。
 
-```bash
-gcc -c -O2 -DNDEBUG -Iinclude -Isrc src/buffer.c -o buffer.o
-gcc -c -O2 -DNDEBUG -Iinclude -Isrc src/hook.c -o hook.o
-gcc -c -O2 -DNDEBUG -Iinclude -Isrc src/trampoline.c -o trampoline.o
-gcc -c -O2 -DNDEBUG -Iinclude -Isrc src/hde/hde64.c -o hde64.o
-ar rcs libminhook.a buffer.o hook.o trampoline.o hde64.o
+按 MinHook 源码树自带的构建说明生成 `libminhook.a`（需编译 `buffer.c`、`hook.c`、`trampoline.c`、`hde/hde64.c`）。然后用同一个 MinGW-w64 工具链链接实现对象：
 
-g++ -shared -m64 -std=c++17 -O2 -DNDEBUG -Iinclude \
-    -o DK4HD_Fix.asi DK4HD_Fix.cpp libminhook.a \
+```bash
+g++ -shared -m64 -std=c++17 -O2 -DNDEBUG -I<MinHook include> \
+    -o DK4HD_Fix.asi <实现>.cpp libminhook.a \
     -luser32 -lwinmm -ld3d11 -ldxgi -static-libgcc -static-libstdc++
 ```
 
@@ -1038,7 +1051,7 @@ python tools\measure_frames.py --game-dir "D:\Games\DK4HD"
 - p50 ∈ **32.5–33.5ms**（原版是 31.25/46.875 双档，p50 落 31.3 左右且大量 46–47ms 帧；旧 `>33` limiter 是 34.0ms）；
 - p95 ≤ **34.0ms**（旧 limiter 35.66ms 不通过）；
 - 45–49.5ms 量化带帧占比 < 1%；
-- p50 折算帧率 29–31fps（仍是约 30fps，不解锁 60fps）。
+- p50 折算帧率 29.5–31.0fps（仍是约 30fps，不解锁 60fps）。
 
 脚本打印 `frames / p5 / p50 / p95 / max / fps` 与判定行；失败时保留 CSV 路径便于复查。允许 30fps 附近，**不要**为了凑数值去改 33ms tick。`SkipIntro=0` 的标题画面是另一条消息泵忙等路径，不作为本项门禁。
 
@@ -1109,9 +1122,10 @@ python tools\test_config.py --game-dir "D:\Games\DK4HD"
 脚本分阶段执行并**备份/恢复原 INI 与日志**：
 
 1. 删除 INI/日志 → 启动 → 断言 INI 自动生成；`[Fix]` 八个键存在且默认值为 `1/1/1/1/1/0/0/0`；日志不存在。
-2. 写入 `Log=1`、`SkipIntro=1`（`60fps=0`，其余 1）→ 启动 3s → 断言日志存在、`config:` 含 `SkipIntro=1`、`skip intro:` 至少三行 patched；窗口出现且进程存活。
-3. 写入 `Log=0`、删除日志 → 启动 2s → 断言日志不存在。
-4. 结束测试进程，恢复原 INI/日志。
+2. 写入 `Log=1`、`SkipIntro=1`（`60fps=0`，其余 1）→ 启动约 2.5s（`--settle-seconds`，默认 2.5）→ 断言日志存在、`config:` 含 `SkipIntro=1`、`skip intro:` 至少三行 patched；窗口出现且进程存活。
+3. 写入 `Log=0`、删除日志 → 启动约 2.5s → 断言日志不存在。
+4. 写入一份已存在的自定义 INI（含唯一 sentinel 注释；`FramePacing=0 CpuIdle=0 ClickLatch=0 ClickRelease=0 EnumCache=0 SkipIntro=1 Log=1 60fps=0`）→ 启动约 2.5s → 断言进程存活、文件**字节完全不变**，且 `config:` 显示这些自定义值（证明读取而非覆盖）。
+5. 结束测试进程，恢复原 INI/日志。
 
 - 退出码 1 表示任一断言失败；失败时保留测试日志/INI。
 - 该脚本只验证配置/日志/片头补丁的安装，不判断画面内容；菜单截图由 9.8 的可选人工步骤或 `tools/test_config.py --screenshot` 输出。
@@ -1156,7 +1170,7 @@ PresentMon（默认启用；`--no-presentmon` 仅做功能检查）在第一个�
 - `warmup` 默认 8 秒，建议至少 8 秒；采样时必须已经在主菜单（测试 INI 的 `SkipIntro=1`）；
 - 任一 Hook 失败、标题不切换、F10 后失焦、启动崩溃、第一个选中 exe 的 PresentMon 采样失败或性能门禁不达标 → 失败。
 
-> 本脚本是 Fast60 的权威验收版本；主项目 `test/fast60_test.py` 已同步相同的临时 INI、limiter 日志检查与 `p50/p95/fps` 性能门禁（16.9 / 17.5 / 59.5）。`--presentmon` 未指定时会自动下载 Intel PresentMon 2.6.0。
+> `tools/fast60_test.py` 是 Fast60 的权威验收版本。`--presentmon` 未指定时会自动下载 Intel PresentMon 2.6.0。
 
 ---
 

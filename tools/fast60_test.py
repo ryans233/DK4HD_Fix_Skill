@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""Fast60 acceptance test for DK4HD_Fix.
+r"""Acceptance check 9.9 -- Fast60, title FPS, F10 and PresentMon gate.
 
 Checks, for each language build:
   1. game starts with a temporary INI (`60fps=1`, `CpuIdle=1`, `SkipIntro=1`,
@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
-import ctypes.wintypes as wt
 import json
 import os
 import statistics
@@ -32,7 +31,8 @@ import subprocess
 import sys
 import time
 
-from _dk4 import backup_files, ensure_no_game_running, write_test_ini
+from _dk4 import (backup_files, ensure_no_game_running, find_window, read_text,
+                  write_test_ini)
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,7 +41,6 @@ OUTDIR = os.path.join(HERE, "out")
 os.makedirs(OUTDIR, exist_ok=True)
 PRESENTMON = os.environ.get("PRESENTMON", os.path.join(HERE, "PresentMon.exe"))
 ALL_EXES = ["DK4HD_tc.exe", "DK4HD_kr.exe", "DK4HD_jp.exe", "DK4HD_sc.exe"]
-WINDOW_CLASS = "KT_DK4_PK_HD_WINDOW_NAME"
 VK_F10 = 0x79
 VK = ctypes.windll.user32
 KERNEL32 = ctypes.windll.kernel32
@@ -53,38 +52,6 @@ KERNEL32 = ctypes.windll.kernel32
 FAST60_P50_MAX_MS = 16.9
 FAST60_P95_MAX_MS = 17.5
 FAST60_MIN_FPS = 59.5
-
-
-def find_window(pid: int) -> int | None:
-    found = []
-
-    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
-    def cb(hwnd, _):
-        if not VK.IsWindowVisible(hwnd):
-            return True
-        p = wt.DWORD()
-        VK.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
-        if p.value != pid:
-            return True
-        cls = ctypes.create_unicode_buffer(128)
-        VK.GetClassNameW(hwnd, cls, 128)
-        if cls.value == WINDOW_CLASS:
-            found.append(hwnd)
-            return False
-        return True
-
-    VK.EnumWindows(cb, 0)
-    return found[0] if found else None
-
-
-def wait_window(pid: int, timeout: float = 20.0) -> int | None:
-    end = time.time() + timeout
-    while time.time() < end:
-        hwnd = find_window(pid)
-        if hwnd:
-            return hwnd
-        time.sleep(0.2)
-    return None
 
 
 def focus(hwnd: int) -> None:
@@ -134,14 +101,6 @@ def press_f10() -> None:
     VK.keybd_event(VK_F10, 0, 0, 0)
     time.sleep(0.08)
     VK.keybd_event(VK_F10, 0, 2, 0)
-
-
-def read_log(path: str) -> str:
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except OSError:
-        return ""
 
 
 def parse_title_mode(text: str) -> tuple[int | None, str | None]:
@@ -199,7 +158,7 @@ def test_exe(exe: str, do_presentmon: bool, timeout: float, warmup: float,
     proc = subprocess.Popen([os.path.join(GAME, exe)], cwd=GAME)
     result["pid"] = proc.pid
     try:
-        hwnd = wait_window(proc.pid, timeout)
+        hwnd = find_window(proc.pid, timeout)
         if not hwnd:
             result["error"] = "game window not found"
             return result
@@ -209,7 +168,7 @@ def test_exe(exe: str, do_presentmon: bool, timeout: float, warmup: float,
 
         t0 = title(hwnd)
         fps0, mode0 = parse_title_mode(t0)
-        log = read_log(log_path)
+        log = read_text(log_path, timeout=2.0)
         checks = result["checks"]
         checks["log_60fps_1"] = "60fps=1" in log
         checks["log_cpuidle_1"] = "CpuIdle=1" in log
@@ -331,13 +290,18 @@ def main() -> int:
             r = test_exe(exe, not args.no_presentmon, args.timeout, args.warmup,
                          args.presentmon_seconds, assert_perf=(idx == 0))
             results.append(r)
+            print(f"[{'PASS' if r.get('ok') else 'FAIL'}] {exe}", flush=True)
             print(json.dumps(r, ensure_ascii=False, indent=2), flush=True)
 
         summary = os.path.join(OUTDIR, "fast60_results.json")
         with open(summary, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
     print(f"summary: {summary}")
-    return 0 if all(r.get("ok") for r in results) else 1
+    if all(r.get("ok") for r in results):
+        print("[PASS] Fast60 acceptance")
+        return 0
+    print("[FAIL] Fast60 acceptance")
+    return 1
 
 
 if __name__ == "__main__":

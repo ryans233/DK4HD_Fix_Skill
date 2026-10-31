@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Acceptance check 9.7 -- same-named INI, optional log, SkipIntro.
+"""Acceptance check 9.7 -- same-named INI, optional log, SkipIntro, no overwrite.
 
     python tools/test_config.py --game-dir "D:\\Games\\DK4HD"
 
@@ -7,6 +7,7 @@ Phases:
   1. no INI/log -> default INI is created (eight keys, Chinese comments), no log
   2. Log=1, SkipIntro=1 -> log exists, config line and three skip patches
   3. Log=0 -> no log file is created
+  4. existing custom INI -> bytes unchanged (no overwrite), custom values are read
 The original INI/log are restored afterwards.
 """
 
@@ -48,6 +49,25 @@ def screenshot(path):
         print(f"screenshot: {path}")
     except Exception as exc:
         print(f"WARNING: screenshot skipped: {exc}")
+
+
+def write_existing_ini(path):
+    """Write a non-default INI with a sentinel; return the exact bytes."""
+    data = (
+        b"; dk4_test_config: existing INI must not be overwritten\r\n"
+        b"[Fix]\r\n"
+        b"FramePacing=0\r\n"
+        b"CpuIdle=0\r\n"
+        b"ClickLatch=0\r\n"
+        b"ClickRelease=0\r\n"
+        b"EnumCache=0\r\n"
+        b"SkipIntro=1\r\n"
+        b"Log=1\r\n"
+        b"60fps=0\r\n"
+    )
+    with open(path, "wb") as f:
+        f.write(data)
+    return data
 
 
 def main():
@@ -178,6 +198,49 @@ def main():
             fail("phase3: log created with Log=0")
         else:
             passed("phase3: no log with Log=0")
+
+        # ---- phase 4: existing INI is not overwritten --------------------
+        before = write_existing_ini(ini_path)
+        try:
+            os.remove(log_path)
+        except OSError:
+            pass
+
+        proc = start_game(exe_path, game_dir)
+        try:
+            time.sleep(args.settle_seconds)
+            alive = proc.poll() is None
+        finally:
+            stop_game(proc)
+        if not alive:
+            fail(f"phase4: {args.exe} exited early")
+
+        try:
+            with open(ini_path, "rb") as f:
+                after = f.read()
+        except OSError as exc:
+            after = b""
+            fail(f"phase4: could not read INI: {exc}")
+        if after == before:
+            passed("phase4: existing INI unchanged")
+        else:
+            fail(f"phase4: existing INI was modified "
+                 f"({len(before)} -> {len(after)} bytes)")
+
+        log_text = read_text(log_path)
+        if not log_text:
+            fail("phase4: log missing with Log=1")
+        else:
+            config_line = next(
+                (ln for ln in log_text.splitlines() if ln.startswith("config: ")), "")
+            expected_fields = (
+                "FramePacing=0", "CpuIdle=0", "ClickLatch=0", "ClickRelease=0",
+                "EnumCache=0", "SkipIntro=1", "Log=1", "60fps=0",
+            )
+            if all(field in config_line for field in expected_fields):
+                passed("phase4: custom config read")
+            else:
+                fail("phase4: custom config line missing/wrong")
 
     if failures:
         print(f"\n{failures} assertion(s) failed.")

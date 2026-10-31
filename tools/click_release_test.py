@@ -14,13 +14,12 @@ restart the game and run this script again; releases should be fewer.
 """
 
 import argparse
-import ctypes
-import ctypes.wintypes as wt
 import os
 import sys
 import time
 
-from _dk4 import ensure_no_game_running
+from _dk4 import (client_center, ensure_no_game_running, find_window,
+                  focus_window, start_game, stop_game, user32)
 
 
 EDGE_RVA = {
@@ -42,54 +41,6 @@ def parse_args():
     return p.parse_args()
 
 
-def find_window(pid, timeout=30.0):
-    user32 = ctypes.windll.user32
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        found = []
-
-        @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
-        def enum_cb(hwnd, _):
-            owner = wt.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
-            if owner.value == pid and user32.IsWindowVisible(hwnd):
-                cls = ctypes.create_unicode_buffer(256)
-                user32.GetClassNameW(hwnd, cls, 256)
-                found.append((hwnd, cls.value))
-            return True
-
-        user32.EnumWindows(enum_cb, 0)
-        for hwnd, cls in found:
-            if cls == "KT_DK4_PK_HD_WINDOW_NAME":
-                return hwnd
-        time.sleep(0.25)
-    return None
-
-
-def focus_window(hwnd):
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    user32.ShowWindow(hwnd, 9)
-    user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0041)
-    user32.BringWindowToTop(hwnd)
-    fg = user32.GetForegroundWindow()
-    t1 = user32.GetWindowThreadProcessId(fg, None)
-    t2 = kernel32.GetCurrentThreadId()
-    user32.AttachThreadInput(t2, t1, True)
-    user32.SetForegroundWindow(hwnd)
-    user32.SetFocus(hwnd)
-    user32.AttachThreadInput(t2, t1, False)
-
-
-def center_client(hwnd):
-    user32 = ctypes.windll.user32
-    rect = wt.RECT()
-    user32.GetClientRect(hwnd, ctypes.byref(rect))
-    pt = wt.POINT((rect.right - rect.left) // 2, (rect.bottom - rect.top) // 2)
-    user32.ClientToScreen(hwnd, ctypes.byref(pt))
-    return pt.x, pt.y
-
-
 def main():
     args = parse_args()
     game_dir = os.path.abspath(args.game_dir)
@@ -106,19 +57,20 @@ def main():
         print("FAIL: Python package 'frida' is required (pip install frida)")
         return 2
 
-    import subprocess
+    proc = start_game(exe, game_dir)
+    session = None
+    script = None
+    presses = releases = 0
+    try:
+        hwnd = find_window(proc.pid)
+        if not hwnd:
+            print("FAIL: game window not found")
+            return 2
 
-    proc = subprocess.Popen([exe], cwd=game_dir)
-    hwnd = find_window(proc.pid)
-    if not hwnd:
-        proc.terminate()
-        print("FAIL: game window not found")
-        return 2
+        focus_window(hwnd)
+        time.sleep(args.settle_seconds)
 
-    focus_window(hwnd)
-    time.sleep(args.settle_seconds)
-
-    js = f"""
+        js = f"""
 const BASE = Process.getModuleByName('{args.exe.lower()}').base;
 let presses = 0, releases = 0;
 Interceptor.attach(BASE.add({EDGE_RVA[args.exe]}), {{
@@ -132,16 +84,14 @@ Interceptor.attach(BASE.add({EDGE_RVA[args.exe]}), {{
 }});
 rpc.exports.stats = function () {{ return [presses, releases]; }};
 """
-    session = frida.attach(proc.pid)
-    script = session.create_script(js)
-    script.load()
+        session = frida.attach(proc.pid)
+        script = session.create_script(js)
+        script.load()
 
-    x, y = center_client(hwnd)
-    user32 = ctypes.windll.user32
-    user32.SetCursorPos(x, y)
-    time.sleep(0.5)
+        x, y = client_center(hwnd)
+        user32.SetCursorPos(x, y)
+        time.sleep(0.5)
 
-    try:
         for _ in range(args.repeats):
             user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
             time.sleep(args.hold_ms / 1000.0)
@@ -150,16 +100,17 @@ rpc.exports.stats = function () {{ return [presses, releases]; }};
         time.sleep(0.6)
         presses, releases = script.exports_sync.stats()
     finally:
-        try:
-            script.unload()
-        except Exception:
-            pass
-        try:
-            session.detach()
-        except Exception:
-            pass
-        proc.terminate()
-        time.sleep(0.4)
+        if script is not None:
+            try:
+                script.unload()
+            except Exception:
+                pass
+        if session is not None:
+            try:
+                session.detach()
+            except Exception:
+                pass
+        stop_game(proc)
 
     print(f"hold={args.hold_ms}ms repeats={args.repeats} "
           f"presses={presses} releases={releases}")

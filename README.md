@@ -91,11 +91,8 @@ tools/
   fast60_test.py      # 9.9 Fast60 + 标题栏/F10/四语言 + limiter 日志与 16.9/17.5/59.5 性能门禁
   enumcache_test.py   # 9.10 设备枚举缓存 + 外部 HID 过滤工具检测 + 前台 >100ms 帧门禁 + A/B
   requirements.txt    # Python 依赖（frida / psutil / Pillow）
-src/
-  DK4HD_Fix.cpp       # 按 skills.md 独立实现的 x64 ASI 源码
-  build.sh            # MSYS2 MinGW-w64 构建（MinHook + 发布/trace 产物）
 ```
 
-`skills.md` 仍是行为真相源；`src/` 是按该规格独立实现的参考源码，构建与验收以第 7 / 9 节为准。
+`skills.md` 仍是行为真相源；构建与验收以第 7 / 9 节为准。
 
 第三方组件（Ultimate-ASI-Loader、MinHook、PresentMon）遵循各自许可证。

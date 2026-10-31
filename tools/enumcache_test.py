@@ -380,9 +380,9 @@ def main():
 
     failed = [r["exe"] for r in results if not r["ok"]]
     if failed:
-        print("FAIL: " + ", ".join(failed))
+        print("[FAIL] " + ", ".join(failed))
         return 1
-    print("PASS: EnumCache acceptance")
+    print("[PASS] EnumCache acceptance")
     return 0
 
 
