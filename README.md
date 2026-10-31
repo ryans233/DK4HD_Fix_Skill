@@ -67,7 +67,7 @@
 
 ## 技术实现
 
-- **帧节奏**：Hook 时间函数，用 `QueryPerformanceCounter` 毫秒值替换 `GetTickCount64` 低 32 位；同时把引擎 limiter 的 `>33` 改成 `>=33`（签名与 patch 见 `skills.md` 2.1），30Hz 从 34ms 变为 33ms。同一线程 1ms 内重复调用时 `Sleep(1)`；帧截止前 3ms 改为自旋。
+- **帧节奏**：Hook 时间函数，用 `QueryPerformanceCounter` 毫秒值替换 `GetTickCount64` 低 32 位；同时把引擎 limiter 的 `>33` 改成 `>=33`（签名与 patch 见 `skills.md` 2.1），30Hz 从 34ms 变为 33ms。limiter 的 elapsed 调用在 1ms 窗口内 `Sleep(1)`；帧截止前 3ms 改为自旋。limiter/thunk 不可用时回退到全局 1ms 节流，CpuIdle 不会退化成忙等。
 - **CPU 忙等 / 定时器周期**：`CpuIdle=1` 时 `timeBeginPeriod(1)`，让 `Sleep(1)` 真正睡 1ms；帧尾自旋使 30Hz 约 7%、Fast60 约 10–12% 单核（不再是早期约 2%）。`Sleep(0)` 不保证空闲，会让 `CpuIdle` 失效。该周期覆盖整个 Hook 生命周期，在 `DLL_PROCESS_DETACH` 用 `timeEndPeriod(1)` 配对释放（仅 `timeBeginPeriod` 返回 `TIMERR_NOERROR` 时），运行中 `FreeLibrary` 也会释放。
 - **点击锁存**：Hook `PeekMessageA` 捕获 `WM_LBUTTONDOWN` / `WM_LBUTTONDBLCLK`，在下一次 `GetDeviceState` 给 `DIMOUSESTATE.rgbButtons[0]` 置位一次。
 - **抬起沿修复**：鼠标轮询 `+0x42` 的 `75 4E` 改为 `EB 4E`，强制走普通路径。
@@ -91,8 +91,11 @@ tools/
   fast60_test.py      # 9.9 Fast60 + 标题栏/F10/四语言 + limiter 日志与 16.9/17.5/59.5 性能门禁
   enumcache_test.py   # 9.10 设备枚举缓存 + 外部 HID 过滤工具检测 + 前台 >100ms 帧门禁 + A/B
   requirements.txt    # Python 依赖（frida / psutil / Pillow）
+src/
+  DK4HD_Fix.cpp       # 按 skills.md 独立实现的 x64 ASI 源码
+  build.sh            # MSYS2 MinGW-w64 构建（MinHook + 发布/trace 产物）
 ```
 
-本仓库只提供规格与验收脚本，不包含实现源码；实现由 LLM 根据 `skills.md` 独立完成。
+`skills.md` 仍是行为真相源；`src/` 是按该规格独立实现的参考源码，构建与验收以第 7 / 9 节为准。
 
 第三方组件（Ultimate-ASI-Loader、MinHook、PresentMon）遵循各自许可证。
