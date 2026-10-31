@@ -19,6 +19,84 @@ user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
 
+def _set_dpi_awareness():
+    """Make ClientToScreen/SetCursorPos use physical pixels on scaled displays."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+        return
+    except Exception:
+        pass
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_set_dpi_awareness()
+
+
+class PROCESSENTRY32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wt.DWORD),
+        ("cntUsage", wt.DWORD),
+        ("th32ProcessID", wt.DWORD),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", wt.DWORD),
+        ("cntThreads", wt.DWORD),
+        ("th32ParentProcessID", wt.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wt.DWORD),
+        ("szExeFile", ctypes.c_char * 260),
+    ]
+
+
+def process_names():
+    """Return lower-case image names of all processes."""
+    names = set()
+    kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+    kernel32.Process32First.argtypes = [wt.HANDLE, ctypes.c_void_p]
+    kernel32.Process32Next.argtypes = [wt.HANDLE, ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [wt.HANDLE]
+    snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if not snap or snap == wt.HANDLE(-1).value:
+        return names
+    try:
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel32.Process32First(snap, ctypes.byref(entry))
+        while ok:
+            names.add(entry.szExeFile.decode("latin1").lower())
+            ok = kernel32.Process32Next(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return names
+
+
+def running_game_processes():
+    """Image names of already running DK4HD builds."""
+    return sorted(n for n in process_names() if n.startswith("dk4hd"))
+
+
+def ensure_no_game_running():
+    """Print a clear failure and return False if a game instance is already up."""
+    busy = running_game_processes()
+    if busy:
+        print(f"FAIL: game already running ({', '.join(busy)}); close it first")
+        return False
+    return True
+
+
+def wait_for_file(path, timeout=10.0):
+    """Wait until *path* exists; return True if it appeared."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.1)
+    return os.path.exists(path)
+
+
 def find_window(pid, timeout=30.0):
     """Return the game's main HWND for *pid*, or None."""
     deadline = time.time() + timeout

@@ -164,7 +164,7 @@ Log=0
 
 **鼠标轮询**
 
-在 `.text` 中搜索唯一 25 字节序列：
+在 `.text` 中搜索唯一 26 字节序列（前缀 13 字节）：
 
 ```text
 48 89 5C 24 10 57 48 83 EC 30 48 8B D9 48 8B 49 10 48 8B 01 FF 90 C8 00 00 00
@@ -184,7 +184,7 @@ Log=0
 83 F8 21 76 02 EB 05
 ```
 
-命中 `hit` 是 `cmp eax,33`。校验 `hit[3..4] == 76 02`，patch `hit+3 = 72`（`jb`）。命中前 5 字节必须是 `E8 rel32`；`target = hit + rel32` 是 elapsed wrapper 的 thunk，供 2.2 读取每帧 `last`。目标不在 `.text` 时只 patch、不安装 thunk Hook。命中 RVA 见第 1 节；该签名在 8 个 exe 中唯一。
+命中 `hit` 是 `cmp eax,33`。校验 `hit[3..4] == 76 02`，patch `hit+3 = 72`（`jb`）。命中前 5 字节必须是 `E8 rel32`；`target = hit + rel32` 是 elapsed wrapper 的 thunk，供 2.2 读取每帧 `last`。该 thunk 可能被动画/标题等多个调用者共享；2.2 只认**返回地址等于 `hit`** 的那次调用。目标不在 `.text` 时只 patch、不安装 thunk Hook。命中 RVA 见第 1 节；该签名在 8 个 exe 中唯一。
 
 **扫描实现**
 
@@ -205,11 +205,12 @@ Log=0
 
 1. **QPC 时间源**：默认 `FramePacing=1`、`CpuIdle=1`；Hook 时间函数，返回 QPC 毫秒值，不调用原函数。
 2. **帧限速器 off-by-one**：当 `FramePacing=1` 或 Fast60 开启（即 QPC 时间源生效）时，按 2.1 节“帧限速器”扫描并 patch；把命中 `+3` 的 `76` 改为 `72`，退出条件由 `>33` 变为 `>=33`。30Hz 由 34.0ms 变为 33.0ms；Fast60 由 17.0ms 变为 16.5ms。`FramePacing=0` 且未开 Fast60 时不要 patch（时间源仍是 `GetTickCount64`，15.6ms 粒度下该修复无意义）。
-3. **1ms 节流 + 帧截止自旋**：
-   - 每线程维护 `last`：同一线程两次调用间隔 < 1ms 时 `Sleep(1)`，然后重新读取 QPC。
-   - 2.1 节签名命中前的 `E8 rel32` 指向 elapsed wrapper 的 thunk。Hook 该 thunk，记录每帧 limiter 的 `last` 时间戳和本次调用的 QPC。
+3. **limiter 1ms 节流 + 帧截止自旋**：
+   - 2.1 节签名命中前的 `E8 rel32` 指向 elapsed wrapper 的 thunk。该 thunk 是**共享跳板**：动画、标题/消息泵等调用者也会经过它。只有**返回地址等于签名命中地址 `hit`** 的那次调用才是 limiter 的 elapsed 查询；Hook 只对这次调用记录 `last` 和 QPC，其他调用不得更新 deadline。
+   - 每线程维护 limiter 的 `last`：仅当当前调用是上述 limiter 调用、且距上次 limiter 调用 < 1ms 时 `Sleep(1)`，然后重新读取 QPC。非 limiter 时间调用直接返回，不参与 1ms 节流。
    - 当当前时间距 `last + 33` 不足 **3 个游戏毫秒（30Hz）/ 4 个游戏毫秒（Fast60）** 时，停止 `Sleep(1)`，改为自旋；其余时间继续 `Sleep(1)`。这样 limiter 在 33ms 截止点精确退出，而不是被 `Sleep(1)` 拖过 33ms。
    - thunk 调用时刻超过 1ms 未刷新时视为已离开 limiter 等待循环，恢复普通节流，避免在渲染/逻辑阶段继续自旋。
+   - **不要把非 limiter 时间调用纳入 1ms 节流**：它们可能位于标题/消息泵或 present 路径；`Sleep(1)` 在部分系统实测约 2ms，会把 present 推过 33ms 截止。30Hz 的主菜单 CPU 目标由 limiter 节流达成；9.2/9.3 明确在主菜单验收。
 4. `InitializeASI` 中调用 `timeBeginPeriod(1)`（仅在 `CpuIdle=1` 时需要）；只在返回 `TIMERR_NOERROR` 时记录“周期已启用”。
 5. 该 1ms 周期必须覆盖整个 Hook 生命周期：在 `DLL_PROCESS_DETACH` 用 `timeEndPeriod(1)` 配对释放（仅当上面记录过成功），同时覆盖运行中 `FreeLibrary` 卸载 ASI 的情况；`winmm` 是静态导入，DETACH 时仍可调用。
 6. 返回 `uint32_t`（调用方使用低 32 位），QPC 毫秒值按 2^32 取模。
@@ -218,10 +219,12 @@ Log=0
 
 | 组合 | 时间源 | limiter patch | 节流 |
 |---|---|---|---|
-| `FramePacing=1, CpuIdle=1` | QPC 1× | 是（33ms） | 1ms 窗口 + 帧尾 3ms 自旋 |
+| `FramePacing=1, CpuIdle=1` | QPC 1× | 是（33ms） | limiter 1ms 窗口 + 帧尾 3ms 自旋 |
 | `FramePacing=1, CpuIdle=0` | QPC 1× | 是 | 不做 `Sleep(1)`（忙等仍在） |
-| `FramePacing=0, CpuIdle=1` | 原 `GetTickCount64` | 否 | 1ms 节流后返回原值 |
+| `FramePacing=0, CpuIdle=1` | 原 `GetTickCount64` | 否 | limiter 1ms 节流后返回原值 |
 | `FramePacing=0, CpuIdle=0` | 原 | 否 | 不 Hook 时间函数 |
+
+非 limiter 时间调用不参与 1ms 节流（见上）。
 
 伪代码（30Hz 路径；Fast60 的 2× 时钟与 4ms 自旋见 2.6）：
 
@@ -234,18 +237,22 @@ uint64_t HookTime(void* arg) {
     static thread_local LARGE_INTEGER last = {};
     static thread_local uint32_t lastLimiterMs = 0;
     static thread_local int64_t lastLimiterQpc = 0;
+    // HookElapsed 仅在 thunk 返回地址 == hit 时，在调用原 thunk 前置 true。
+    static thread_local bool inLimiterCall = false;
 
     bool nearDeadline = false;
     if (lastLimiterMs && now.QuadPart - lastLimiterQpc < ticksPerMs) {
         const int32_t remain = (int32_t)(lastLimiterMs + 33u - (uint32_t)gameNow);
         nearDeadline = remain <= 3 && remain >= -3; // Fast60: margin = 4
     }
-    if (!nearDeadline && cpuIdle && last.QuadPart &&
-        now.QuadPart - last.QuadPart < ticksPerMs) {
-        Sleep(1);
-        QueryPerformanceCounter(&now);
+    if (inLimiterCall) {
+        if (!nearDeadline && cpuIdle && last.QuadPart &&
+            now.QuadPart - last.QuadPart < ticksPerMs) {
+            Sleep(1);
+            QueryPerformanceCounter(&now);
+        }
+        last = now;
     }
-    last = now;
 
     if (!framePacing)
         return origTime(arg);          // 原时间函数（来自 Hook trampoline）
@@ -255,9 +262,10 @@ uint64_t HookTime(void* arg) {
 }
 ```
 
-- `lastLimiterMs` / `lastLimiterQpc` 由 elapsed wrapper thunk 的 Hook 写入；`last` 仍是 30Hz 的节流时间戳。
+- `lastLimiterMs` / `lastLimiterQpc` 由 elapsed wrapper thunk 的 Hook 写入，且**仅当返回地址 == `hit`**；`last` 仍是 30Hz limiter 的节流时间戳。非 limiter 调用不更新 `last`，也不 Sleep。
 - 返回值只需保证低 32 位正确；`uint32_t` 或 `uint64_t & 0xFFFFFFFF` 均可。
 - `ticksPerMs = qpcFreq / 1000`；若为 0 则设为 1。
+- `Sleep(1)` 不保证 1ms；在部分 Windows 配置下 `timeBeginPeriod(1)` 返回成功但实测约 2ms。自旋 margin 与 Present 等待必须按“至少 2ms”保守设计；不要假设 Sleep 恰好 1ms。
 - **顺序要求**：QPC 频率、`ticksPerMs`、`timeBeginPeriod(1)` 必须在启用 Hook 前设置好，否则 Hook 可能除以 0。
 - 该 Hook 必须只替换时间函数；不要修改 `GetTickCount64` 本身。
 - 关闭时间 Hook（`FramePacing=0, CpuIdle=0` 且不开 Fast60）时，不要创建/启用时间 MinHook，也不要 patch limiter 或安装 elapsed thunk Hook。
@@ -266,8 +274,9 @@ uint64_t HookTime(void* arg) {
 
 **验收**
 
-- PresentMon 15s（`60fps=0`）：`msBetweenPresents` p50 **33.00ms**，p95 **33.10ms**，`SyncInterval=1`；旧 `>33` limiter 的 34.0ms 不再接受。
-- 最热线程 CPU ≈ **7%** 单核（30Hz；`60fps=0`）。Fast60 约 10–12%，见 2.6。
+- PresentMon 15s（`60fps=0`，主菜单 `SkipIntro=1`）：`msBetweenPresents` p50 **33.00ms**，p95 **33.10ms**，`SyncInterval=1`；旧 `>33` limiter 的 34.0ms 不再接受。
+- 最热线程 CPU ≈ **7%** 单核（30Hz 主菜单；`60fps=0`）。Fast60 约 10–12%，见 2.6。
+- 9.2/9.3 的验收状态是主菜单（`SkipIntro=1`）；`SkipIntro=0` 的标题画面是另一条消息泵忙等路径，不作为 30Hz 帧时间/CPU 门禁。
 - 默认仍约 30fps（33ms ≈ 30.3fps）；**不要**通过改 33ms tick 解锁 60fps。可选 Fast60 见 2.6，必须默认关闭。
 - 30Hz 的 33ms 来自 limiter `>=33` + 3ms 帧尾自旋：只改时钟（不 patch limiter）仍是 34.0ms；只 patch limiter 但保留无自旋的 `Sleep(1)` 节流，会因 Sleep 抖动偶尔超过 33ms。
 
@@ -391,13 +400,14 @@ uint64_t HookTime(void* arg) {
   - ❌ 不需要转场回退 30Hz。
 - 上述补偿属于“保持原时长”的实验模式；与 Fast60 的全局 ×2 叠加会变成 4× 或产生混合时钟。
 - 结果：依赖时间源的等待/动画整体约 2× 速；1000ms 超时约变为 500ms。
-- `CpuIdle=1` 时，Fast60 的时间调用必须使用**独立的 1ms 校准窗口**，不能复用 2.2 的“本次调用距上次 <1ms 就 Sleep”逻辑：
+- `CpuIdle=1` 时，Fast60 的 **limiter elapsed 查询** 必须使用**独立的 1ms 校准窗口**，不能复用 2.2 的 `last`：
   - 维护 `thread_local` 的 `lastCalib`，与 30Hz 路径的 `last` **分开**；
-  - 仅当 `lastCalib == 0 || now - lastCalib >= ticksPerMs` 时执行一次 `Sleep(1)`，重新读取 QPC，并更新 `lastCalib`；
-  - 同一 1ms 窗口内的后续时间调用直接进入 ×2 返回，不再 Sleep；
+  - 仅当当前调用是 2.2 的 limiter 调用（返回地址 == `hit`）、且 `lastCalib == 0 || now - lastCalib >= ticksPerMs` 时执行一次 `Sleep(1)`，重新读取 QPC，并更新 `lastCalib`；
+  - 非 limiter 时间调用直接进入 ×2 返回，不 Sleep；
+  - 同一 1ms 窗口内的后续 limiter 调用直接进入 ×2 返回，不再 Sleep；
   - 当进入 `last + 33` 前 4 个游戏毫秒（2ms 墙钟）时，跳过 `Sleep(1)` 改为自旋；`last` 来自 2.2 的 elapsed thunk Hook，与 `lastCalib` 分开；
   - 30Hz 路径（`g_fast60 == false`）继续使用 2.2 的 `last` / 3ms 自旋逻辑；两个模式不共用一个节流时间戳。
-- 反例：在 Fast60 下沿用 2.2 的 `last` 判断并在每次调用都 `Sleep(1)`，会把主菜单/转场拖慢；实测特征是 `CpuIdle=1` 的 Fast60 主菜单 PresentMon p50 ≈ **19ms**（约 52fps）。正确实现 p50 **16.667ms**、p95 **16.667ms**、约 **60.0fps**；旧 `>33` limiter 是 17.0ms / 58.8fps（另一种回归）。验收脚本对这些特征设硬门禁（9.9）。
+- 反例：在 Fast60 下沿用 2.2 的 `last` 判断并在每次 limiter 调用都 `Sleep(1)`，会把主菜单/转场拖慢；实测特征是 `CpuIdle=1` 的 Fast60 主菜单 PresentMon p50 ≈ **19ms**（约 52fps）。正确实现 p50 **16.667ms**、p95 **16.667ms**、约 **60.0fps**；旧 `>33` limiter 是 17.0ms / 58.8fps（另一种回归）。验收脚本对这些特征设硬门禁（9.9）。
 
 ```c
 // Fast60 时间 Hook 的节流（伪代码；30Hz 分支仍按 2.2）
@@ -407,16 +417,18 @@ static thread_local LARGE_INTEGER last = {};       // 30Hz 路径
 static thread_local LARGE_INTEGER lastCalib = {};  // Fast60 路径，独立
 static thread_local uint32_t lastLimiterMs = 0;    // 2.2 的 elapsed thunk Hook 写入
 static thread_local int64_t lastLimiterQpc = 0;
+static thread_local bool inLimiterCall = false;    // 仅返回地址 == hit 时置 true
 
 const uint64_t gameNow = now.QuadPart * 2000ULL / qpcFreq.QuadPart;
 const int32_t remain = (int32_t)(lastLimiterMs + 33u - (uint32_t)gameNow);
 const bool nearDeadline =
     lastLimiterMs && (now.QuadPart - lastLimiterQpc) < ticksPerMs &&
     remain <= 4 && remain >= -4;
+const bool limiterCall = inLimiterCall;
 
 if (!fast) {
     // 2.2 的 30Hz 分支（含 3ms 自旋）
-} else if (cpuIdle && !nearDeadline &&
+} else if (limiterCall && cpuIdle && !nearDeadline &&
            (lastCalib.QuadPart == 0 ||
             (now.QuadPart - lastCalib.QuadPart) >= ticksPerMs)) {
     Sleep(1);
@@ -434,6 +446,7 @@ return ms & 0xFFFFFFFFULL;
 - 通过临时 D3D11 device + swap chain 取 `IDXGISwapChain::Present` 的共享 vtable 槽位（slot 8）。
 - 只统计/限速 `DXGI_PRESENT_TEST` 之外的 Present。
 - Fast60 开启时，以 QPC 目标 `qpcFreq / 60` 限速；`last` 必须是 **thread_local**，避免多线程共用时间戳互相阻塞。
+- 等待策略：剩余时间 > **2 × ticksPerMs** 时 `Sleep(1)`，最后约 2ms 自旋；`Sleep(1)` 在部分系统实测约 2ms，若按 1 tick 就 Sleep 会把 p95 推到 17.5ms 以上（9.9 门禁）。
 - 不要把 Present 复制两次（复制 Present 属于另一套 Safe60 行为，不在 Fast60 规格内）。
 - Present Hook 失败时，Fast60 不得启用。
 
@@ -771,6 +784,8 @@ python tools\check_startup.py --game-dir "D:\Games\DK4HD"
 
 `--game-dir` 是游戏根目录（与 `DK4HD_*.exe` 同级）。脚本只启动游戏、读 `<ASI同名>.log`、发点击、读 PresentMon CSV；不修改游戏文件，也不依赖任何反汇编产物。依赖见 `tools/requirements.txt`（`frida`、`psutil`、`Pillow`）。
 
+> 所有脚本共享游戏目录、INI 与日志，必须串行运行；启动前统一用 `_dk4.ensure_no_game_running()` 检查残留 `DK4HD_*.exe`。`_dk4.py` 导入时设置 DPI awareness，并提供 INI 备份/临时写入与文件就绪等待辅助。9.2 / 9.3 会写入主菜单临时 INI（`SkipIntro=1`、`60fps=0`）并在结束后恢复。
+
 > 默认 `Log=0` 不会生成日志。9.1 / 9.4 / 9.6 需要用日志或 Frida；9.1 / 9.4 会先备份 INI、临时把 `Log` 设为 1，结束后恢复。9.6 使用 Frida 直接读游戏输入状态，不依赖日志。
 
 ### 9.1 启动与 Hook —— `tools/check_startup.py`
@@ -794,7 +809,7 @@ python tools\check_startup.py --game-dir "D:\Games\DK4HD"
 python tools\measure_frames.py --game-dir "D:\Games\DK4HD"
 ```
 
-流程：启动游戏 → 等 18s（把加载/片头卡顿移出统计窗口）→ PresentMon `--v1_metrics --timed 15` → 统计 `msBetweenPresents`。未指定 `--presentmon` 时脚本自动把 Intel 官方 PresentMon 2.6.0 x64 下载到 `%TEMP%`。**本项必须在 `60fps=0` 下运行**；`60fps=1` 的 Fast60 由 9.9 验收。
+流程：备份 INI/日志 → 写入临时 INI（`SkipIntro=1`、`60fps=0`、其余默认）→ 启动游戏 → 等 18s（把加载/片头卡顿移出统计窗口）→ PresentMon `--v1_metrics --timed 15` → 统计 `msBetweenPresents` → 恢复原文件。启动前检查残留实例。未指定 `--presentmon` 时脚本自动把 Intel 官方 PresentMon 2.6.0 x64 下载到 `%TEMP%`。**本项必须在 `60fps=0` 的主菜单下运行**；`60fps=1` 的 Fast60 由 9.9 验收。
 
 通过条件（脚本内置同样的判定）：
 
@@ -804,7 +819,7 @@ python tools\measure_frames.py --game-dir "D:\Games\DK4HD"
 - 45–49.5ms 量化带帧占比 < 1%；
 - p50 折算帧率 29–31fps（仍是约 30fps，不解锁 60fps）。
 
-脚本打印 `frames / p5 / p50 / p95 / max / fps` 与判定行；失败时保留 CSV 路径便于复查。允许 30fps 附近，**不要**为了凑数值去改 33ms tick。
+脚本打印 `frames / p5 / p50 / p95 / max / fps` 与判定行；失败时保留 CSV 路径便于复查。允许 30fps 附近，**不要**为了凑数值去改 33ms tick。`SkipIntro=0` 的标题画面是另一条消息泵忙等路径，不作为本项门禁。
 
 ### 9.3 CPU —— `tools/measure_cpu.py`
 
@@ -812,11 +827,12 @@ python tools\measure_frames.py --game-dir "D:\Games\DK4HD"
 python tools\measure_cpu.py --game-dir "D:\Games\DK4HD"
 ```
 
-启动游戏、等 10s，用 `psutil` 按 1s 间隔采样每个线程的累计 CPU 时间并换算成峰值。百分比以“单核满载 = 100%”为单位，不需要再按核数换算。**本项在 `60fps=0` 下运行**；Fast60 的 CPU 约 10–12%，不要用本门槛验收。
+备份 INI/日志 → 写入临时 INI（`SkipIntro=1`、`60fps=0`、其余默认）→ 启动游戏、等 10s → 用 `psutil` 按 1s 间隔采样每个线程的累计 CPU 时间并换算成峰值 → 恢复原文件。启动前检查残留实例。百分比以“单核满载 = 100%”为单位，不需要再按核数换算。**本项在 `60fps=0` 的主菜单下运行**；Fast60 的 CPU 约 10–12%，不要用本门槛验收。
 
 - 通过：最热线程 ≤ **12% 单核**（30Hz 实测约 7%；未修复时该线程 ≈ 100% 单核，特征极明显）；
 - 12% 上限包含帧尾 3ms 自旋，不是早期“约 2%”的阈值；不要为了回到 2% 去掉自旋，否则 9.2 的 33ms 节拍会退化为 34ms 或抖动；
 - 不要求所有线程都空闲；脚本只打印前 3 个线程。
+- `SkipIntro=0` 的标题画面消息泵忙等不作为本项门禁；主菜单 `SkipIntro=1` 才是 30Hz CPU 的验收状态。
 
 ### 9.4 点击 —— `tools/click_test.py`
 
@@ -896,7 +912,7 @@ python tools\fast60_test.py --game-dir "D:\Games\DK4HD" --exe DK4HD_kr.exe
 python tools\fast60_test.py --game-dir "D:\Games\DK4HD" --warmup 12 --presentmon-seconds 15
 ```
 
-脚本会先备份 INI/日志，临时写入 `[Fix]`：`FramePacing=1`、`CpuIdle=1`、`ClickLatch=1`、`ClickRelease=1`、`SkipIntro=1`、`Log=1`、`60fps=1`，跑完恢复原文件。`SkipIntro=1` 确保采样落在主菜单而不是片头。
+脚本会先检查残留游戏实例，备份 INI/日志，临时写入 `[Fix]`：`FramePacing=1`、`CpuIdle=1`、`ClickLatch=1`、`ClickRelease=1`、`EnumCache=1`、`SkipIntro=1`、`Log=1`、`60fps=1`，跑完恢复原文件。`SkipIntro=1` 确保采样落在主菜单而不是片头。
 
 对每个 exe 检查：
 
@@ -908,7 +924,7 @@ python tools\fast60_test.py --game-dir "D:\Games\DK4HD" --warmup 12 --presentmon
 PresentMon（默认启用；`--no-presentmon` 仅做功能检查）在第一个选中的 exe（默认 TC）上采样 Fast60 主菜单稳态：
 
 - `p50 <= 16.9ms`、`p95 <= 17.5ms`、`fps >= 59.5`；正确实现 p50/p95 ≈ **16.667ms**、fps ≈ **59.9–60.0**；
-- 该门禁同时捕捉两类回归：旧 `>33` limiter p50 ≈ **17.0ms**、fps ≈ **58.8**；每次时间调用都 `Sleep(1)` p50 ≈ **19.2ms**、p95 ≈ **20.6ms**、fps ≈ 52；
+- 该门禁同时捕捉两类回归：旧 `>33` limiter p50 ≈ **17.0ms**、fps ≈ **58.8**；每次 limiter 调用都 `Sleep(1)` p50 ≈ **19.2ms**、p95 ≈ **20.6ms**、fps ≈ 52；
 - 其余语言只记录 p50/p95，不按语言间差异设门槛；30Hz 时 p50 ≈ **33.0–33.1ms** 仅作记录。
 
 通过标准：
@@ -933,7 +949,7 @@ python tools\enumcache_test.py --game-dir "E:\Games\DK4HD" --no-ab --no-presentm
 
 脚本启动先**检测外部 HID 过滤工具**（内核驱动文件、服务状态、客户端/看护进程、安装目录、配置键是否可读），命中时打印一段说明并把结果写入 `out/enumcache_results.json` 的 `environment`；检测只提示，不判失败。
 
-运行前必须关闭已运行的游戏实例（脚本会检测到并以 `FAIL` 中止，避免与用户正在玩的进程抢窗口/PresentMon）。临时 INI 写入 `FramePacing=1`、`CpuIdle=1`、`ClickLatch=1`、`ClickRelease=1`、`SkipIntro=1`、`Log=1`、`60fps=0`、`EnumCache=<0|1>`，跑完恢复原文件。
+运行前必须关闭已运行的游戏实例（脚本用 `_dk4.ensure_no_game_running()` 检查，命中时以 `FAIL` 中止，避免与用户正在玩的进程抢窗口/PresentMon）。临时 INI 写入 `FramePacing=1`、`CpuIdle=1`、`ClickLatch=1`、`ClickRelease=1`、`SkipIntro=1`、`Log=1`、`60fps=0`、`EnumCache=<0|1>`，跑完恢复原文件。
 
 每个 exe 的缓存运行（`EnumCache=1`）检查：
 
@@ -980,7 +996,7 @@ A/B（默认最多尝试 2 个 exe，出现慢基线即停）：同一 exe 用 `
 - ❌ 把 `VK_LEFT` / `VK_RIGHT` 放进菜单按键去抖：海战左右控帆会变成一格一格，必须排除。
 - ❌ 只在 `GetAsyncKeyState` 里屏蔽 F10，却让监控线程也走同一个 Hook：监控永远读不到 F10，无法切换。
 - ❌ 只 hook `PeekMessageW`：游戏导入的是 `PeekMessageA`，F10 仍会进入 MFC 菜单栏并失焦。
-- ❌ Fast60 直接复用 2.2 的 `last` 阈值并在每次时间调用都 `Sleep(1)`：主菜单 p50 会从 **16.667ms** 掉到约 19ms（约 52fps），`tools/fast60_test.py` 的 `p50 <= 16.9ms` 门禁会判 FAIL；必须用独立 `lastCalib` 做 1ms 窗口限速。
+- ❌ Fast60 直接复用 2.2 的 `last` 阈值并在每次 limiter 调用都 `Sleep(1)`：主菜单 p50 会从 **16.667ms** 掉到约 19ms（约 52fps），`tools/fast60_test.py` 的 `p50 <= 16.9ms` 门禁会判 FAIL；必须用独立 `lastCalib` 做 1ms 窗口限速。
 - ❌ 只把 Fast60 时钟写成 `ms = qpc_ms * 2`（先截断再 ×2）：只产生偶数游戏毫秒，33 不可达，limiter 仍落到 34 → 17.0ms / 58.8fps。必须 `qpc * 2000 / freq`（先乘后除）。
 - ❌ 只 patch limiter（`>33 → >=33`）而不做高分辨率 2× 时钟：33 仍不可达，p50 仍是 17.0ms。两处必须同时改。
 - ❌ 只改时钟而不 patch limiter：`>33` 仍要求 34，p50 仍是 17.0ms（30Hz 是 34.0ms）。

@@ -13,7 +13,8 @@ import re
 import sys
 import time
 
-from _dk4 import backup_files, read_text, start_game, stop_game, write_test_ini
+from _dk4 import (backup_files, ensure_no_game_running, read_text, start_game,
+                  stop_game, write_test_ini)
 
 
 DEFAULT_EXES = ["DK4HD_tc.exe", "DK4HD_kr.exe", "DK4HD_jp.exe", "DK4HD_sc.exe"]
@@ -31,6 +32,8 @@ def parse_args():
 def main():
     args = parse_args()
     game_dir = os.path.abspath(args.game_dir)
+    if not ensure_no_game_running():
+        return 2
     ini_path = os.path.join(game_dir, args.asi_name + ".ini")
     log_path = os.path.join(game_dir, args.asi_name + ".log")
     failures = 0

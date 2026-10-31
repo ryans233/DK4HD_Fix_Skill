@@ -3,10 +3,11 @@
 
     python tools/measure_cpu.py --game-dir "D:\\Games\\DK4HD"
 
-Samples per-thread CPU time with psutil while the game idles at its front end.
+Samples per-thread CPU time with psutil while the game idles at the main menu.
 Percentages are per logical core (100 = one fully busy core). The unfixed build
-spins one thread at ~100%.  Run with 60fps=0 (30Hz): the frame-deadline spin
-costs ~7% there; Fast60 is ~10-12% and is not gated by this check.
+spins one thread at ~100%.  The script backs up the INI, writes a temporary
+main-menu 30Hz INI (SkipIntro=1, 60fps=0), and restores it afterwards.  Fast60
+is ~10-12% and is not gated by this check.
 """
 
 import argparse
@@ -14,7 +15,8 @@ import os
 import sys
 import time
 
-from _dk4 import start_game, stop_game
+from _dk4 import (backup_files, ensure_no_game_running, start_game,
+                  stop_game, write_test_ini)
 
 
 def parse_args():
@@ -25,6 +27,7 @@ def parse_args():
     p.add_argument("--samples", type=int, default=6)
     p.add_argument("--interval-ms", type=int, default=1000)
     p.add_argument("--max-hot-thread", type=float, default=12.0)
+    p.add_argument("--asi-name", default="DK4HD_Fix")
     return p.parse_args()
 
 
@@ -43,6 +46,8 @@ def main():
     if not os.path.isfile(exe_path):
         print(f"FAIL: {exe_path} not found")
         return 2
+    if not ensure_no_game_running():
+        return 2
 
     try:
         import psutil
@@ -50,30 +55,38 @@ def main():
         print("FAIL: Python package 'psutil' is required (pip install psutil)")
         return 2
 
-    proc = start_game(exe_path, game_dir)
-    try:
-        time.sleep(args.settle_seconds)
-        if proc.poll() is not None:
-            print(f"FAIL: {args.exe} exited early (code {proc.returncode})")
-            return 2
+    ini_path = os.path.join(game_dir, args.asi_name + ".ini")
+    log_path = os.path.join(game_dir, args.asi_name + ".log")
+    with backup_files([ini_path, log_path]):
+        # 9.3 is a main-menu measurement: SkipIntro=1, 30Hz, no log.
+        write_test_ini(ini_path, skip=1, log=0, fps=0, enum=1)
+        print("test INI: FramePacing=1 CpuIdle=1 ClickLatch=1 ClickRelease=1 "
+              "EnumCache=1 SkipIntro=1 Log=0 60fps=0")
 
-        ps = psutil.Process(proc.pid)
-        previous = snapshot(ps)
-        peak = {}
-        interval = args.interval_ms / 1000.0
+        proc = start_game(exe_path, game_dir)
+        try:
+            time.sleep(args.settle_seconds)
+            if proc.poll() is not None:
+                print(f"FAIL: {args.exe} exited early (code {proc.returncode})")
+                return 2
 
-        for _ in range(args.samples):
-            time.sleep(interval)
-            current = snapshot(ps)
-            for thread_id, current_time in current.items():
-                old_time = previous.get(thread_id)
-                if old_time is None:
-                    continue
-                percent = max(0.0, (current_time - old_time) / interval * 100.0)
-                peak[thread_id] = max(peak.get(thread_id, 0.0), percent)
-            previous = current
-    finally:
-        stop_game(proc)
+            ps = psutil.Process(proc.pid)
+            previous = snapshot(ps)
+            peak = {}
+            interval = args.interval_ms / 1000.0
+
+            for _ in range(args.samples):
+                time.sleep(interval)
+                current = snapshot(ps)
+                for thread_id, current_time in current.items():
+                    old_time = previous.get(thread_id)
+                    if old_time is None:
+                        continue
+                    percent = max(0.0, (current_time - old_time) / interval * 100.0)
+                    peak[thread_id] = max(peak.get(thread_id, 0.0), percent)
+                previous = current
+        finally:
+            stop_game(proc)
 
     if not peak:
         print("FAIL: no thread samples collected")

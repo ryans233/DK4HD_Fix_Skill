@@ -18,12 +18,14 @@ import time
 
 from _dk4 import (
     backup_files,
+    ensure_no_game_running,
     find_window,
     focus_window,
     read_ini,
     read_text,
     start_game,
     stop_game,
+    wait_for_file,
     write_test_ini,
 )
 
@@ -57,6 +59,8 @@ def main():
     if not os.path.isfile(exe_path):
         print(f"FAIL: {exe_path} not found")
         return 2
+    if not ensure_no_game_running():
+        return 2
 
     failures = 0
 
@@ -77,6 +81,7 @@ def main():
                 pass
 
         proc = start_game(exe_path, game_dir)
+        wait_for_file(ini_path, timeout=10.0)
         time.sleep(args.settle_seconds)
         if proc.poll() is not None:
             fail(f"phase1: {args.exe} exited early")

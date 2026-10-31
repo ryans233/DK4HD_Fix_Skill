@@ -32,12 +32,8 @@ import subprocess
 import sys
 import time
 
-from _dk4 import backup_files
+from _dk4 import backup_files, ensure_no_game_running, write_test_ini
 
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
-    ctypes.windll.user32.SetProcessDPIAware()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GAME = os.environ.get("DK4HD_GAME", r"E:\Games\DK4HD")
@@ -57,27 +53,6 @@ KERNEL32 = ctypes.windll.kernel32
 FAST60_P50_MAX_MS = 16.9
 FAST60_P95_MAX_MS = 17.5
 FAST60_MIN_FPS = 59.5
-
-
-def write_fast60_ini(path: str) -> None:
-    """Temporary INI: Fast60 + default CPU idle + SkipIntro -> main menu."""
-    text = (
-        "; Fast60 acceptance INI (temporary; restored after the test)\n"
-        "[Fix]\n"
-        "FramePacing=1\n"
-        "CpuIdle=1\n"
-        "ClickLatch=1\n"
-        "ClickRelease=1\n"
-        "SkipIntro=1\n"
-        "Log=1\n"
-        "60fps=1\n"
-    )
-    with open(path, "w", encoding="utf-8", newline="\r\n") as f:
-        f.write(text)
-
-
-def set_dpi_aware() -> None:
-    pass
 
 
 def find_window(pid: int) -> int | None:
@@ -329,6 +304,8 @@ def main() -> int:
     if not os.path.isdir(GAME):
         print(f"missing game directory: {GAME}")
         return 2
+    if not ensure_no_game_running():
+        return 2
     if not args.no_presentmon:
         if args.presentmon:
             PRESENTMON = args.presentmon
@@ -344,7 +321,7 @@ def main() -> int:
     log = os.path.join(GAME, "DK4HD_Fix.log")
     results = []
     with backup_files([ini, log]):
-        write_fast60_ini(ini)
+        write_test_ini(ini, skip=1, log=1, fps=1, enum=1)
         for idx, exe in enumerate(exes):
             if not os.path.exists(os.path.join(GAME, exe)):
                 results.append({"exe": exe, "ok": False, "error": "exe not found"})

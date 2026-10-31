@@ -20,6 +20,8 @@ import os
 import sys
 import time
 
+from _dk4 import ensure_no_game_running
+
 
 EDGE_RVA = {
     "DK4HD_tc.exe": 0x41BB0,
@@ -94,6 +96,8 @@ def main():
     exe = os.path.join(game_dir, args.exe)
     if not os.path.isfile(exe):
         print(f"FAIL: {exe} not found")
+        return 2
+    if not ensure_no_game_running():
         return 2
 
     try:

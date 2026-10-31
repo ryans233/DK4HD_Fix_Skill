@@ -40,13 +40,8 @@ import subprocess
 import sys
 import time
 
-from _dk4 import (backup_files, find_window, focus_window, read_text, start_game,
-                  stop_game, write_test_ini)
-
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
-    ctypes.windll.user32.SetProcessDPIAware()
+from _dk4 import (backup_files, ensure_no_game_running, find_window, focus_window,
+                  process_names, read_text, start_game, stop_game, write_test_ini)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUTDIR = os.path.join(HERE, "out")
@@ -66,7 +61,6 @@ HIDHIDE_DIR = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
                            "Nefarius Software Solutions", "HidHide")
 
 USER32 = ctypes.windll.user32
-KERNEL32 = ctypes.windll.kernel32
 
 
 # ---------------------------------------------------------------------------
@@ -77,36 +71,6 @@ class SERVICE_STATUS(ctypes.Structure):
                 ("dwControlsAccepted", wt.DWORD), ("dwWin32ExitCode", wt.DWORD),
                 ("dwServiceSpecificExitCode", wt.DWORD), ("dwCheckPoint", wt.DWORD),
                 ("dwWaitHint", wt.DWORD)]
-
-
-class PROCESSENTRY32(ctypes.Structure):
-    _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD),
-                ("th32ProcessID", wt.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
-                ("th32ModuleID", wt.DWORD), ("cntThreads", wt.DWORD),
-                ("th32ParentProcessID", wt.DWORD), ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", wt.DWORD), ("szExeFile", ctypes.c_char * 260)]
-
-
-def _process_names():
-    names = set()
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.CreateToolhelp32Snapshot.restype = wt.HANDLE
-    k32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
-    k32.Process32First.argtypes = [wt.HANDLE, ctypes.c_void_p]
-    k32.Process32Next.argtypes = [wt.HANDLE, ctypes.c_void_p]
-    snap = k32.CreateToolhelp32Snapshot(0x2, 0)   # TH32CS_SNAPPROCESS
-    if not snap or snap == wt.HANDLE(-1).value:
-        return names
-    try:
-        entry = PROCESSENTRY32()
-        entry.dwSize = ctypes.sizeof(entry)
-        ok = k32.Process32First(snap, ctypes.byref(entry))
-        while ok:
-            names.add(entry.szExeFile.decode("latin1").lower())
-            ok = k32.Process32Next(snap, ctypes.byref(entry))
-    finally:
-        k32.CloseHandle(snap)
-    return names
 
 
 def _service_state(name):
@@ -151,11 +115,6 @@ def _config_readable():
     return False if rc == 5 else None            # 5 = ERROR_ACCESS_DENIED
 
 
-def running_game_processes():
-    """Image names of already running DK4HD builds (the test launches its own)."""
-    return sorted(n for n in _process_names() if n.startswith("dk4hd"))
-
-
 def detect_hidhide():
     root = os.environ.get("SystemRoot", r"C:\Windows")
     info = {
@@ -164,7 +123,7 @@ def detect_hidhide():
         "service_state": _service_state("HidHide"),
         "client_install": HIDHIDE_DIR if os.path.isfile(
             os.path.join(HIDHIDE_DIR, "x64", "HidHideCLI.exe")) else None,
-        "running": sorted(n for n in _process_names() if n.startswith("hidhide")),
+        "running": sorted(n for n in process_names() if n.startswith("hidhide")),
         "config_readable": _config_readable(),
     }
     info["present"] = bool(info["driver_file"] or info["service_state"]
@@ -366,9 +325,7 @@ def main():
     ini = os.path.join(game, args.asi_name + ".ini")
     log = os.path.join(game, args.asi_name + ".log")
 
-    busy = running_game_processes()
-    if busy:
-        print(f"FAIL: game already running ({', '.join(busy)}); close it first")
+    if not ensure_no_game_running():
         return 2
 
     hidhide = detect_hidhide()

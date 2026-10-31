@@ -24,6 +24,7 @@ import time
 from _dk4 import (
     backup_files,
     client_center,
+    ensure_no_game_running,
     find_window,
     focus_window,
     read_text,
@@ -56,6 +57,8 @@ def main():
     log_path = os.path.join(game_dir, args.asi_name + ".log")
     if not os.path.isfile(exe_path):
         print(f"FAIL: {exe_path} not found")
+        return 2
+    if not ensure_no_game_running():
         return 2
 
     trace_backup = None

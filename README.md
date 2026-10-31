@@ -81,7 +81,7 @@
 README.md          # 本说明
 skills.md          # 完整行为规格 / skill
 tools/
-  _dk4.py             # 共享 Windows/INI/日志辅助
+  _dk4.py             # 共享 Windows/INI/日志/DPI/实例检查辅助
   check_startup.py    # 9.1 启动与 Hook
   measure_frames.py   # 9.2 帧时间
   measure_cpu.py      # 9.3 CPU

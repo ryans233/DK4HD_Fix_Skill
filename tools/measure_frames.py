@@ -7,7 +7,9 @@ Launches the game, lets it settle, records a 15 s PresentMon capture with
 --v1_metrics, and checks msBetweenPresents percentiles. PresentMon 2.6.0 is
 downloaded from the official Intel release when --presentmon is not supplied.
 
-Run this with 60fps=0 (30Hz).  Fast60 is covered by tools/fast60_test.py (9.9).
+The script backs up the INI/log, writes a temporary main-menu 30Hz INI
+(SkipIntro=1, 60fps=0), and restores it afterwards.  Fast60 is covered by
+tools/fast60_test.py (9.9).
 """
 
 import argparse
@@ -19,7 +21,8 @@ import tempfile
 import time
 import urllib.request
 
-from _dk4 import start_game, stop_game
+from _dk4 import (backup_files, ensure_no_game_running, start_game,
+                  stop_game, write_test_ini)
 
 
 PRESENTMON_URL = (
@@ -36,6 +39,7 @@ def parse_args():
     p.add_argument("--seconds", type=int, default=15)
     p.add_argument("--presentmon", default="")
     p.add_argument("--csv", default="")
+    p.add_argument("--asi-name", default="DK4HD_Fix")
     p.add_argument("--p50-min", type=float, default=32.5)
     p.add_argument("--p50-max", type=float, default=33.5)
     p.add_argument("--p95-max", type=float, default=34.0)
@@ -69,11 +73,15 @@ def main():
     if not os.path.isfile(exe_path):
         print(f"FAIL: {exe_path} not found")
         return 2
+    if not ensure_no_game_running():
+        return 2
     presentmon = ensure_presentmon(args.presentmon)
     if not os.path.isfile(presentmon):
         print(f"FAIL: PresentMon not found: {presentmon}")
         return 2
 
+    ini_path = os.path.join(game_dir, args.asi_name + ".ini")
+    log_path = os.path.join(game_dir, args.asi_name + ".log")
     csv_path = args.csv or os.path.join(
         tempfile.gettempdir(),
         f"dk4hd_frames_{os.path.splitext(args.exe)[0]}.csv")
@@ -82,22 +90,28 @@ def main():
     except OSError:
         pass
 
-    proc = start_game(exe_path, game_dir)
-    time.sleep(args.settle_seconds)
-    if proc.poll() is not None:
-        print(f"FAIL: {args.exe} exited before capture (code {proc.returncode})")
-        stop_game(proc)
-        return 2
+    with backup_files([ini_path, log_path]):
+        # 9.2 is a main-menu measurement: SkipIntro=1, 30Hz, no log.
+        write_test_ini(ini_path, skip=1, log=0, fps=0, enum=1)
+        print("test INI: FramePacing=1 CpuIdle=1 ClickLatch=1 ClickRelease=1 "
+              "EnumCache=1 SkipIntro=1 Log=0 60fps=0")
 
-    try:
-        subprocess.run(
-            [presentmon, "--process_id", str(proc.pid), "--output_file", csv_path,
-             "--v1_metrics", "--no_console_stats", "--timed", str(args.seconds),
-             "--terminate_after_timed"],
-            check=False,
-        )
-    finally:
-        stop_game(proc)
+        proc = start_game(exe_path, game_dir)
+        time.sleep(args.settle_seconds)
+        if proc.poll() is not None:
+            print(f"FAIL: {args.exe} exited before capture (code {proc.returncode})")
+            stop_game(proc)
+            return 2
+
+        try:
+            subprocess.run(
+                [presentmon, "--process_id", str(proc.pid), "--output_file", csv_path,
+                 "--v1_metrics", "--no_console_stats", "--timed", str(args.seconds),
+                 "--terminate_after_timed"],
+                check=False,
+            )
+        finally:
+            stop_game(proc)
 
     if not os.path.isfile(csv_path):
         print(f"FAIL: no capture written to {csv_path}")
