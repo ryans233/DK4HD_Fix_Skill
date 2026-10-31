@@ -125,6 +125,7 @@ Log=0
   - `config: ini=<path> log=<path> FramePacing=... CpuIdle=... ClickLatch=... ClickRelease=... EnumCache=... SkipIntro=... Log=... 60fps=...`（`60fps` 字段用于 Fast60 验收；顺序不限）
   - 各 Hook/补丁的状态（找到/未找到、成功/失败）。
 - 不要在每个输入帧写日志；日志只用于启动/安装诊断。
+- 日志是跨线程的（游戏线程的枚举/Hook 日志 + 监控线程的 F10/标题日志）：整行写入必须用临界区/互斥量串行化，避免 `vfprintf` 与 `fputc/fflush` 之间被其他线程插入。
 - 验收构建可以额外输出 `latch` / `inject` 行（见 9.4），但发布构建必须遵守 `Log` 开关。
 
 **验收**
@@ -204,13 +205,14 @@ Log=0
 **目标行为**
 
 1. **QPC 时间源**：默认 `FramePacing=1`、`CpuIdle=1`；Hook 时间函数，返回 QPC 毫秒值，不调用原函数。
-2. **帧限速器 off-by-one**：当 `FramePacing=1` 或 Fast60 开启（即 QPC 时间源生效）时，按 2.1 节“帧限速器”扫描并 patch；把命中 `+3` 的 `76` 改为 `72`，退出条件由 `>33` 变为 `>=33`。30Hz 由 34.0ms 变为 33.0ms；Fast60 由 17.0ms 变为 16.5ms。`FramePacing=0` 且未开 Fast60 时不要 patch（时间源仍是 `GetTickCount64`，15.6ms 粒度下该修复无意义）。
+2. **帧限速器 off-by-one**：当 `FramePacing=1` 或 Fast60 开启（即 QPC 时间源生效）时，按 2.1 节“帧限速器”扫描并 patch；把命中 `+3` 的 `76` 改为 `72`，退出条件由 `>33` 变为 `>=33`。30Hz 由 34.0ms 变为 33.0ms；Fast60 由 17.0ms 变为 16.5ms。`FramePacing=0` 且未开 Fast60 时**不要 patch**（时间源仍是 `GetTickCount64`，15.6ms 粒度下该修复无意义），但仍要定位 limiter 并 Hook 其 elapsed thunk，供下面的 CpuIdle 节流使用。
 3. **limiter 1ms 节流 + 帧截止自旋**：
    - 2.1 节签名命中前的 `E8 rel32` 指向 elapsed wrapper 的 thunk。该 thunk 是**共享跳板**：动画、标题/消息泵等调用者也会经过它。只有**返回地址等于签名命中地址 `hit`** 的那次调用才是 limiter 的 elapsed 查询；Hook 只对这次调用记录 `last` 和 QPC，其他调用不得更新 deadline。
    - 每线程维护 limiter 的 `last`：仅当当前调用是上述 limiter 调用、且距上次 limiter 调用 < 1ms 时 `Sleep(1)`，然后重新读取 QPC。非 limiter 时间调用直接返回，不参与 1ms 节流。
    - 当当前时间距 `last + 33` 不足 **3 个游戏毫秒（30Hz）/ 4 个游戏毫秒（Fast60）** 时，停止 `Sleep(1)`，改为自旋；其余时间继续 `Sleep(1)`。这样 limiter 在 33ms 截止点精确退出，而不是被 `Sleep(1)` 拖过 33ms。
-   - thunk 调用时刻超过 1ms 未刷新时视为已离开 limiter 等待循环，恢复普通节流，避免在渲染/逻辑阶段继续自旋。
+   - thunk 调用时刻超过 1ms 未刷新时视为已离开 limiter 等待循环，不再按该 deadline 自旋；非 limiter 时间调用本身不参与 1ms 节流（见下一条）。
    - **不要把非 limiter 时间调用纳入 1ms 节流**：它们可能位于标题/消息泵或 present 路径；`Sleep(1)` 在部分系统实测约 2ms，会把 present 推过 33ms 截止。30Hz 的主菜单 CPU 目标由 limiter 节流达成；9.2/9.3 明确在主菜单验收。
+   - **thunk 不可用时必须回退到全局 1ms 节流**：limiter 签名扫描失败、thunk 未找到或 thunk Hook 创建失败时，`CpuIdle=1` 不能退化为 100% 忙等；此时对所有时间调用按 1ms 窗口节流（本仓库 `src/DK4HD_Fix.cpp` 的 `g_scopedThrottle=false` 路径）。
 4. `InitializeASI` 中调用 `timeBeginPeriod(1)`（仅在 `CpuIdle=1` 时需要）；只在返回 `TIMERR_NOERROR` 时记录“周期已启用”。
 5. 该 1ms 周期必须覆盖整个 Hook 生命周期：在 `DLL_PROCESS_DETACH` 用 `timeEndPeriod(1)` 配对释放（仅当上面记录过成功），同时覆盖运行中 `FreeLibrary` 卸载 ASI 的情况；`winmm` 是静态导入，DETACH 时仍可调用。
 6. 返回 `uint32_t`（调用方使用低 32 位），QPC 毫秒值按 2^32 取模。
@@ -224,47 +226,98 @@ Log=0
 | `FramePacing=0, CpuIdle=1` | 原 `GetTickCount64` | 否 | limiter 1ms 节流后返回原值 |
 | `FramePacing=0, CpuIdle=0` | 原 | 否 | 不 Hook 时间函数 |
 
-非 limiter 时间调用不参与 1ms 节流（见上）。
+非 limiter 时间调用不参与 1ms 节流；只有 thunk 不可用时的全局回退例外（见下）。
 
-伪代码（30Hz 路径；Fast60 的 2× 时钟与 4ms 自旋见 2.6）：
+伪代码（30Hz + Fast60 共用；Fast60 的 2× 时钟与 4ms 自旋见 2.6）：
 
 ```c
-uint64_t HookTime(void* arg) {
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    const uint64_t gameNow = now.QuadPart * 1000ULL / qpcFreq.QuadPart;
+// InitializeASI 先决定：
+//   qpcOk        = QueryPerformanceFrequency(...) && freq > 0
+//   needTime     = qpcOk && (framePacing || cpuIdle || fast60Requested)
+//   needPatch    = qpcOk && (framePacing || fast60Requested)
+//   scopedThrottle = false;   // 仅在 elapsed thunk Hook 成功后置 true
+//   limiterHit     = 0;       // 签名命中（cmp eax,33h）地址
+//   ticksPerMs     = qpcOk ? max(freq / 1000, 1) : 1
 
-    static thread_local LARGE_INTEGER last = {};
-    static thread_local uint32_t lastLimiterMs = 0;
-    static thread_local int64_t lastLimiterQpc = 0;
-    // HookElapsed 仅在 thunk 返回地址 == hit 时，在调用原 thunk 前置 true。
-    static thread_local bool inLimiterCall = false;
+struct ThreadTiming {
+    LARGE_INTEGER last;        // 30Hz limiter 的 1ms 窗口
+    LARGE_INTEGER lastCalib;   // Fast60 的独立 1ms 校准窗口
+    uint32_t lastLimiterMs;    // limiter 的每帧 last 时间戳
+    int64_t  lastLimiterQpc;   // 该 last 被读到的 QPC
+    bool     inLimiterCall;    // 仅 HookElapsed 的 limiter 调用置 true
+};
+static thread_local ThreadTiming t;
+
+uint64_t HookTime(void* arg) {
+    LARGE_INTEGER now = {0};
+    if (!QueryPerformanceCounter(&now))       // QPC 不可用时安全回退
+        return origTime ? origTime(arg) : (GetTickCount64() & 0xFFFFFFFF);
+    if (!qpcFreq.QuadPart)
+        return origTime ? origTime(arg) : (GetTickCount64() & 0xFFFFFFFF);
+
+    bool fast = fast60;
+    uint64_t gameNow = fast ? now.QuadPart * 2000 / qpcFreq.QuadPart
+                            : now.QuadPart * 1000 / qpcFreq.QuadPart;
 
     bool nearDeadline = false;
-    if (lastLimiterMs && now.QuadPart - lastLimiterQpc < ticksPerMs) {
-        const int32_t remain = (int32_t)(lastLimiterMs + 33u - (uint32_t)gameNow);
-        nearDeadline = remain <= 3 && remain >= -3; // Fast60: margin = 4
+    if (t.lastLimiterMs && now.QuadPart - t.lastLimiterQpc < ticksPerMs) {
+        int32_t remain = (int32_t)(t.lastLimiterMs + 33u - (uint32_t)gameNow);
+        int32_t margin = fast ? 4 : 3;        // 4 游戏毫秒 = 2ms 墙钟
+        nearDeadline = remain <= margin && remain >= -margin;
     }
-    if (inLimiterCall) {
-        if (!nearDeadline && cpuIdle && last.QuadPart &&
-            now.QuadPart - last.QuadPart < ticksPerMs) {
+
+    // thunk Hook 可用时只节流 limiter 的 elapsed 调用；不可用时全局回退。
+    bool inScope = !scopedThrottle || t.inLimiterCall;
+    if (!fast) {
+        if (inScope) {
+            if (cpuIdle && !nearDeadline && t.last.QuadPart &&
+                now.QuadPart - t.last.QuadPart < ticksPerMs) {
+                Sleep(1);
+                QueryPerformanceCounter(&now);
+            }
+            t.last = now;                     // 只推进 limiter 的窗口
+        }
+    } else {
+        if (inScope && cpuIdle && !nearDeadline &&
+            (t.lastCalib.QuadPart == 0 ||
+             now.QuadPart - t.lastCalib.QuadPart >= ticksPerMs)) {
             Sleep(1);
             QueryPerformanceCounter(&now);
+            t.lastCalib = now;                // 只在真正 Sleep 后推进
         }
-        last = now;
     }
 
-    if (!framePacing)
-        return origTime(arg);          // 原时间函数（来自 Hook trampoline）
+    if (fast)
+        return (now.QuadPart * 2000 / qpcFreq.QuadPart) & 0xFFFFFFFF;
+    if (framePacing)
+        return (now.QuadPart * 1000 / qpcFreq.QuadPart) & 0xFFFFFFFF;
+    return origTime ? origTime(arg) : (GetTickCount64() & 0xFFFFFFFF);
+}
 
-    const uint64_t ms = now.QuadPart * 1000ULL / qpcFreq.QuadPart;
-    return ms & 0xFFFFFFFFULL;
+uint32_t HookElapsed(void* self, uint32_t last) {
+    // thunk 是共享跳板：动画/标题/present 也会经过。只有返回地址等于
+    // limiter 的 cmp 命中地址时，才允许更新 deadline / 进入节流作用域。
+    if (limiterHit &&
+        (uintptr_t)__builtin_return_address(0) == limiterHit) {
+        t.lastLimiterMs = last;
+        LARGE_INTEGER qpc = {0};
+        if (QueryPerformanceCounter(&qpc))
+            t.lastLimiterQpc = qpc.QuadPart;
+        t.inLimiterCall = true;
+        uint32_t r = origElapsed ? origElapsed(self, last) : 0;
+        t.inLimiterCall = false;
+        return r;
+    }
+    return origElapsed ? origElapsed(self, last) : 0;
 }
 ```
 
-- `lastLimiterMs` / `lastLimiterQpc` 由 elapsed wrapper thunk 的 Hook 写入，且**仅当返回地址 == `hit`**；`last` 仍是 30Hz limiter 的节流时间戳。非 limiter 调用不更新 `last`，也不 Sleep。
-- 返回值只需保证低 32 位正确；`uint32_t` 或 `uint64_t & 0xFFFFFFFF` 均可。
-- `ticksPerMs = qpcFreq / 1000`；若为 0 则设为 1。
+- **`scopedThrottle` 的取值**：只有 `elapsedThunk` Hook 创建成功才置 `true`。limiter 签名没找到、thunk 没找到、`MH_CreateHook` 失败或 MinHook 未初始化时置 `false`；此时 `HookTime` 对所有调用做全局 1ms 节流，保证 `FramePacing=0, CpuIdle=1` 与 Fast60 58.8 FPS 回退路径不会变成 100% 忙等。
+- **locate 与 patch 解耦**：`FramePacing=0 && 60fps=0` 不 patch `limiter+3`，但仍要定位 `limiterHit`/`elapsedThunk` 并安装 thunk Hook；否则 `CpuIdle=1` 没有作用域可用，只能走全局回退。
+- `lastLimiterMs` / `lastLimiterQpc` 由 elapsed wrapper thunk 的 Hook 写入，且**仅当返回地址 == `limiterHit`**；非 limiter 调用既不改 deadline，也不推进 `t.last` / `t.lastCalib`、不 `Sleep`。
+- 在 `scopedThrottle=true` 时，`t.inLimiterCall` 只在调用原 elapsed wrapper 期间为 true；`HookTime` 由该 wrapper 内部调用时才能进入节流窗口。
+- 返回地址在 MinGW 用 `__builtin_return_address(0)`，MSVC 用 `_ReturnAddress()`；两者都必须在未被内联的 Hook 函数里读取。
+- `ticksPerMs = qpcFreq / 1000`；若为 0 则设为 1。`QueryPerformanceFrequency` 失败时必须禁用时间 Hook、limiter patch 与 Fast60（鼠标/EnumCache/SkipIntro 仍可用），不得用 `freq=1` 继续。
 - `Sleep(1)` 不保证 1ms；在部分 Windows 配置下 `timeBeginPeriod(1)` 返回成功但实测约 2ms。自旋 margin 与 Present 等待必须按“至少 2ms”保守设计；不要假设 Sleep 恰好 1ms。
 - **顺序要求**：QPC 频率、`ticksPerMs`、`timeBeginPeriod(1)` 必须在启用 Hook 前设置好，否则 Hook 可能除以 0。
 - 该 Hook 必须只替换时间函数；不要修改 `GetTickCount64` 本身。
@@ -488,6 +541,7 @@ return ms & 0xFFFFFFFFULL;
   ```
 
 - 一次物理按下只放行一次；按住不足 400ms 时返回“未按下”；超过 400ms 后按 33ms 间隔重复。
+- 400ms / 33ms 计时用 QPC 毫秒（或至少 1ms 的时钟）；`CpuIdle=0` 时 `GetTickCount64` 约 15.6ms 粒度，会把 33ms 重复量化成 31.25/46.875ms。
 - **绝不能把 `VK_LEFT` / `VK_RIGHT` 放进这个列表**：海战左右控帆是连续控制，去抖会让控帆一顿一顿。
 
 **启用与日志**
@@ -501,7 +555,36 @@ Fast60 只有在以下全部成功时才启用：
 - `PeekMessageA` Hook 成功；
 - `MH_EnableHook` 成功。
 
-帧限速器 patch 与 elapsed thunk Hook **不参与 all-or-nothing**：扫描失败时仍启用 Fast60，但上限约 58.8 FPS，并写日志；9.9 的性能门禁要求它们成功。建议在启用 Fast60 前完成 patch/thunk Hook，以便日志顺序稳定。
+帧限速器 patch 与 elapsed thunk Hook **不参与 all-or-nothing**：扫描失败时仍启用 Fast60，但上限约 58.8 FPS，并写日志；thunk Hook 不可用时 `CpuIdle=1` 使用全局 1ms 节流，不得退化为 100% 忙等。9.9 的性能门禁要求它们成功。建议在启用 Fast60 前完成 patch/thunk Hook，以便日志顺序稳定。
+
+启用/监控线程伪代码：
+
+```c
+bool ready = timeHooked && presentHooked && keyHooked && peekHooked &&
+             MH_EnableHook(MH_ALL_HOOKS) == MH_OK;
+
+if (fast60Requested) {
+    if (ready) {
+        fast60Feature = true;
+        fast60 = true;
+        HANDLE th = CreateThread(NULL, 0, MonitorThread, NULL, 0, NULL);
+        if (!th) {
+            // 没有监控线程就没有 F10 切换/标题 FPS；不能只吞 F10。
+            fast60Feature = false;
+            fast60 = false;
+            log("fast60 requested but not enabled (... monitor=0)");
+        } else {
+            CloseHandle(th);
+            log("fast60 enabled at startup (global 2x clock, ~2x game speed)");
+        }
+    } else {
+        log("fast60 requested but not enabled (key=... peek=... present=... time=... enable=...)");
+    }
+}
+```
+
+- `fast60Feature` 控制 F10 消息/`GetAsyncKeyState(VK_F10)` 抑制；监控线程创建失败时必须回滚为 false，否则 F10 被吞但无法切换。
+- Present Hook 的临时 D3D11 device 创建失败时，可再尝试 `D3D_DRIVER_TYPE_WARP`；两者都失败才认定 Present Hook 失败（Fast60 不启用）。
 
 日志必须包含：
 
@@ -562,6 +645,95 @@ frame limiter elapsed hook failed: <status>
 - 只有首次枚举成功（`SUCCEEDED(hr)`）且单键设备数未超过 16 时才把条目标记为可回放；枚举失败或设备数溢出时回落到真实枚举，不要缓存半截结果。
 - 加一个重入标志：重入或表满时直接调用原函数，并保证所有分支都释放该标志。
 - 回调返回 `DIENUM_STOP` 时立即停止回放。
+
+伪代码（pending/commit 模型，避免半截结果进入回放）：
+
+```c
+struct Entry {
+    DWORD devType, flags;
+    bool valid, overflow, invalid;   // valid 只由 commit 置位
+    int count;
+    BYTE blobs[16][1104];
+};
+Entry slots[4];
+int used = 0;                       // 只统计已 commit 的条目
+
+Entry* find(DWORD type, DWORD flags) {   // 只返回已发布条目
+    for (int i = 0; i < used; ++i)
+        if (slots[i].devType == type && slots[i].flags == flags)
+            return &slots[i];
+    return NULL;
+}
+
+Entry* begin(DWORD type, DWORD flags) {  // pending 槽，find 不可见
+    if (find(type, flags) || used >= 4) return NULL;
+    Entry* e = &slots[used];             // 不递增 used
+    reset(e);
+    e->devType = type;
+    e->flags = flags;
+    return e;
+}
+
+bool capture(Entry* e, const void* inst) {
+    if (e->valid) return false;
+    if (!inst) { e->invalid = true; return false; }
+    uint32_t size = *(uint32_t*)inst;
+    if (size < 4) { e->invalid = true; return false; }
+    if (e->count >= 16) { e->overflow = true; return false; }
+    memcpy(e->blobs[e->count], inst, min(size, 1104));
+    ++e->count;
+    return true;
+}
+
+bool commit(Entry* e) {
+    if (e->valid || e->overflow || e->invalid) return false;
+    if (e != &slots[used]) return false;
+    e->valid = true;
+    ++used;
+    return true;
+}
+
+void abort(Entry* e) {              // pending 槽复位；已发布条目不动
+    if (e->valid) return;
+    e->count = 0; e->overflow = false; e->invalid = false;
+}
+
+typedef struct { EnumCallback cb; void* ref; Entry* e; bool stopped; } Ctx;
+
+BOOL capture_cb(const void* inst, void* ref) {
+    Ctx* c = (Ctx*)ref;
+    capture(c->e, inst);                  // 失败只置标志，仍转发
+    BOOL r = c->cb(inst, c->ref);
+    if (r == DIENUM_STOP) c->stopped = true;
+    return r;
+}
+
+HRESULT HookEnumDevices(self, type, cb, ref, flags) {
+    if (!cb || reentrant) return real(self, type, cb, ref, flags);
+    if (Entry* e = find(type, flags)) {
+        for (int i = 0; i < e->count; ++i)
+            if (cb(e->blobs[i], ref) == DIENUM_STOP) break;
+        log("dinput enum: replayed ...");
+        return DI_OK;
+    }
+    Entry* e = begin(type, flags);
+    if (!e) return real(self, type, cb, ref, flags);
+
+    Ctx ctx = { cb, ref, e, false };
+    HRESULT hr = real(self, type, capture_cb, &ctx, flags);
+    if (SUCCEEDED(hr) && !ctx.stopped && commit(e)) {
+        log("dinput enum: captured %d device(s) ... cached", e->count);
+    } else {
+        abort(e);
+        log("dinput enum: capture failed ... hr=... overflow=... invalid=... stopped=...");
+    }
+    return hr;
+}
+```
+
+- `used` 只在 `commit()` 成功时递增；失败/中止的 pending 槽不会进入 `find()`，下一次调用可原位重试。
+- 用户回调返回 `DIENUM_STOP` 表示这次枚举不完整（`stopped`），不得缓存；下一次调用重新枚举。
+- 重入/表满时直接调用原函数；所有分支都要清重入标志。
 - 首次调用仍会慢一次（约 440ms），发生在进入主菜单前，属可接受成本。
 
 已知代价与边界：
@@ -646,12 +818,61 @@ dinput enum: replayed <n> device(s) type=0x<dwDevType> flags=0x<dwFlags>
 7. 读取 `.text` 的 `VirtualAddress` / `Misc.VirtualSize`。
 8. 若 `SkipIntro=1`：按 2.5 定位并改写三处函数；写 `skip intro: ... patched at ...`（关闭时写 `skip intro: disabled`）。
 9. 若 `FramePacing=1 || CpuIdle=1 || 60fps=1`：按 2.1 定位时间函数；若 `ClickLatch=1 || ClickRelease=1`：定位鼠标轮询；失败按第 1 节 RVA 回退并校验；写 `time=<ptr> mouse=<ptr> (scan)`。
-9a. 若 `FramePacing=1 || 60fps=1`：按 2.1 节扫描 limiter 签名并 patch `+3`；解析签名前 `E8 rel32` 得到 elapsed thunk。写 `frame limiter: >33 -> >=33 at <ptr> (thunk=<ptr>)`；失败写 2.6 的对应日志并继续（Fast60 上限约 58.8 FPS）。
+9a. 只要时间 Hook 需要安装（`FramePacing=1 || CpuIdle=1 || 60fps=1`）：按 2.1 节扫描 limiter 签名、解析签名前 `E8 rel32` 得到 elapsed thunk；仅在 `FramePacing=1 || 60fps=1` 时 patch `+3` 并写 `frame limiter: >33 -> >=33 at <ptr> (thunk=<ptr>)`。`FramePacing=0 && 60fps=0` 时只定位 thunk 并写 `frame limiter: located at <ptr> (thunk=<ptr>), patch disabled`，供 CpuIdle 节流。失败写 2.6 的对应日志并继续（Fast60 上限约 58.8 FPS；CpuIdle 回退全局节流）。
 10. 若 `ClickRelease=1`：校验并改写鼠标轮询 `+0x42`（`75 4E` → `EB 4E`）；写 `release fix: poll+0x42 patched at <ptr>`（关闭时写 `release fix: disabled`）。
 11. 若 `ClickLatch=1`：安装鼠标轮询 inline Hook；写 `mouse poll hook: 1`（失败写 0，并停止后续输入 Hook）。
 12. 若时间 Hook、`ClickLatch` 或 `EnumCache` 需要 MinHook：`MH_Initialize`；创建时间 Hook（若需要）；创建 elapsed thunk Hook（若步骤 9a 成功）；创建 `PeekMessageA` Hook（若 `ClickLatch=1`）；创建 `DirectInput8Create` Hook（若 `EnumCache=1`）；`MH_EnableHook(MH_ALL_HOOKS)`；分别写 `time hook: <status> (FramePacing=... CpuIdle=...)`、`frame limiter elapsed hook: <status>`、`hook PeekMessageA: <status>`、`dinput enum hook: <status>`、`MH_EnableHook: <status>`。
 13. 游戏首次调用 `DirectInput8Create` 成功后，用返回的 `IDirectInput8*` **原地**改虚表槽位 4（`EnumDevices`），保存原函数指针；写 `hooked IDirectInput8::EnumDevices at <ptr>`。
 14. 首次鼠标轮询时安装 DInput 虚表 Hook；写 `hooked mouse GetDeviceState dev=<ptr> vt=<ptr> real=<ptr>`。
+
+时间/limiter 分支的伪代码（与 2.2 配合）：
+
+```c
+bool qpcOk = QueryPerformanceFrequency(&qpcFreq) && qpcFreq.QuadPart > 0;
+if (!qpcOk) {
+    qpcFreq.QuadPart = 0;
+    ticksPerMs = 1;
+    // 不安装时间 Hook、不 patch limiter、不启用 Fast60
+}
+bool needTime  = qpcOk && (framePacing || cpuIdle || fast60Requested);
+bool needPatch = qpcOk && (framePacing || fast60Requested);
+
+if (needTime) {
+    timeAddr = findTimeFunction();          // 2.1 签名 + RVA 回退
+    limiterHit = findUnique(limiterSig);    // 2.1，7 字节唯一签名
+    elapsedThunk = 0;
+    if (limiterHit) {
+        elapsedThunk = decodeE8Target(limiterHit - 5);  // 必须在 .text
+        if (needPatch) {
+            if (patchByte(limiterHit + 3, 0x72))
+                log("frame limiter: >33 -> >=33 at ... (thunk=...)");
+            else
+                log("frame limiter: patch failed ..."); // 保留 hit/thunk
+        } else {
+            log("frame limiter: located at ... (thunk=...), patch disabled");
+        }
+    } else {
+        log(needPatch ? "frame limiter: signature not found; Fast60 stays at ~58.8 FPS"
+                      : "frame limiter: signature not found; CpuIdle uses the global throttle");
+    }
+}
+
+bool timeHooked = false;
+if (needTime && timeAddr)
+    timeHooked = MH_CreateHook(timeAddr, HookTime, &origTime) == MH_OK;
+
+bool elapsedHooked = false;
+if (needTime && limiterHit && elapsedThunk && minhookOk)
+    elapsedHooked = MH_CreateHook(elapsedThunk, HookElapsed, &origElapsed) == MH_OK;
+
+scopedThrottle = elapsedHooked;
+if (cpuIdle && timeHooked && !scopedThrottle)
+    log("time throttle: global fallback (limiter thunk hook unavailable)");
+
+// Fast60 的 all-or-nothing 只看 time/present/key/peek/enable；
+// limiter patch / elapsed thunk Hook 失败不阻止启用，但会回退 58.8 FPS
+// 与全局节流。
+```
 
 - 两个时间开关都为 0、`ClickLatch=0` 且 `EnumCache=0` 时，不要初始化 MinHook。
 - `ClickRelease` 是纯内存字节补丁，不依赖 MinHook。
